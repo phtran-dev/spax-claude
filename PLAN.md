@@ -71,13 +71,15 @@ spax-claude/
 │   │   └── LifecycleController.java      # Admin API quản lý lifecycle rules
 │   ├── queue/
 │   │   ├── IngestQueue.java               # Interface: publish/consume abstraction
-│   │   ├── IngestMessage.java             # Value object: file path + tenant + timestamp
+│   │   ├── IngestMessage.java             # Value object: file paths + tenant + timestamp
 │   │   ├── RedisStreamIngestQueue.java    # Impl: Redis Streams (default)
-│   │   └── WalIngestQueue.java            # Impl: file-based WAL (future, no Redis dependency)
+│   │   └── WalIngestQueue.java            # Impl: file-based WAL (future)
+│   ├── transfer/
+│   │   └── TransferCommitListener.java    # Nhận event từ Transfer Server → push to queue
 │   ├── ingest/
-│   │   ├── IngestController.java          # POST /api/v1/{tenant}/ingest (batch upload)
-│   │   ├── IngestService.java             # Save file + queue.publish()
-│   │   ├── IndexingConsumer.java          # queue.consume() → parse → batch insert
+│   │   ├── IngestController.java          # POST /api/v1/{tenant}/ingest (batch upload, REST client)
+│   │   ├── IngestService.java             # Core: move file + queue.publish()
+│   │   ├── IndexingConsumer.java          # queue.consume() → parse → store → batch insert DB
 │   │   └── DicomParser.java              # Extract metadata from DICOM file (skip pixel data)
 │   ├── selfmanage/
 │   │   ├── AutoPartitionService.java      # Tạo partitions tự động 12 tháng trước
@@ -577,42 +579,74 @@ Spring `@ConditionalOnProperty` tự chọn đúng implementation.
 
 ## Phase 3: Ingest Pipeline
 
-### 3.1 Batch Ingest API
+### 3.0 Tổng quan các đường ingest
+
+```
+Đường 1 (chính):  Orthanc Gateway → [Transfers Plugin] → Transfer Server (đã implement)
+                                                            → files on temp dir
+                                                            → commit xong
+                                                            → TransferCommitListener
+                                                            → ingestQueue.publish()
+
+Đường 2 (REST):   Any client → POST /api/v1/{tenant}/ingest (multipart)
+                                → IngestController
+                                → lưu file vào temp
+                                → ingestQueue.publish()
+
+Đường 3 (STOW):   DICOMWeb client → POST /dicomweb/{tenant}/studies (STOW-RS)
+                                → StowController
+                                → lưu file vào temp
+                                → ingestQueue.publish()
+
+Tất cả 3 đường hội tụ vào cùng pipeline:
+    ingestQueue → IndexingConsumer → parse → move file → index DB
+```
+
+### 3.1 Transfer Server Integration
+
+**TransferCommitListener.java**: Được gọi khi Transfer Server hoàn tất commit.
+
+**Input**: Danh sách file paths trên temp dir + tenant code.
+
+**Flow:**
+1. Transfer Server nhận đủ files từ Orthanc → commit thành công
+2. TransferCommitListener nhận event (callback hoặc scan temp dir)
+3. Với mỗi file: `ingestQueue.publish(IngestMessage{filePath, tenantCode, receivedAt})`
+4. Transfer Server trả OK cho Orthanc
+
+### 3.2 Batch Ingest API (REST)
 
 **IngestController.java**: `POST /api/v1/{tenant}/ingest`
 - Accept: `multipart/form-data` với nhiều DICOM files
-- Hoặc: `application/octet-stream` cho single file
-- Hoặc: `multipart/related; type="application/dicom"` (STOW-RS compatible)
+- Flow: nhận file → lưu vào temp dir → `ingestQueue.publish()` → return 200 OK
+
+### 3.3 Async Indexing Worker
+
+**IndexingConsumer.java**: Consume từ queue, xử lý batch.
 
 **Flow:**
-1. Nhận file(s) từ request
-2. Với mỗi file: lưu vào storage (local/S3) ngay lập tức
-3. Publish message vào Redis Stream với file path
-4. Return 200 OK ngay (không đợi indexing)
-
-### 3.2 Async Indexing Worker
-
-**IndexingConsumer.java**: Spring Bean, đọc từ Redis Stream.
-
-**Flow:**
-1. Consume batch messages từ Redis Stream (max 200 messages/lần)
-2. Với mỗi message: parse DICOM file → extract metadata (skip pixel data!)
-3. Thu thập batch: group by patient → study → series → instances
-4. Flush batch vào PostgreSQL:
+```
+1. Consume batch messages từ queue (max 200 messages/lần)
+2. Với mỗi file trên temp dir:
+   a. Parse DICOM header (skip pixel data) → extract metadata
+   b. Move file từ temp → permanent storage (volume)
+      Path: {volume}/{tenant}/{hash}/{studyUid}/{seriesUid}/{sopUid}.dcm
+3. Group metadata: patient → study → series → instances
+4. Batch upsert vào PostgreSQL (1 transaction):
    - UPSERT patients (ON CONFLICT patient_id DO UPDATE)
    - UPSERT studies (ON CONFLICT study_instance_uid DO UPDATE)
    - UPSERT series (ON CONFLICT series_instance_uid DO UPDATE)
    - Bulk INSERT instances
-   - Tất cả trong 1 transaction
-5. ACK messages trong Redis Stream
+5. ACK messages trong queue
+6. Nếu fail 1 file → move sang /error/ → log → tiếp tục
+```
 
 **DicomParser.java**:
 - Dùng `DicomInputStream` với `IncludeBulkData.NO` → skip pixel data
-- Extract tất cả tags cần thiết cho 4 levels
-- Convert remaining tags thành JSONB cho `dicom_metadata` column
+- Extract tags cần thiết cho 4 levels (Patient/Study/Series/Instance)
 
 **BulkInsertRepository.java**: Raw JDBC, không dùng JPA cho insert path.
-- Dùng prepared statement batching
+- Prepared statement batching
 - `INSERT ... ON CONFLICT ... DO UPDATE` cho patient, study, series
 - Batch size 200 instances per flush
 
