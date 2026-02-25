@@ -169,6 +169,14 @@ CREATE TABLE tenant (
 - Instance: **Partition by `created_date` (range, monthly)** — system-generated, luôn đúng
 - Không dùng DICOM StudyDate làm partition key (unreliable, máy chụp có thể gửi sai/thiếu)
 
+**Thiết kế lấy ý tưởng từ dcm4chee arc-light:**
+- `dicom_attrs BYTEA` trên Study/Series — lưu full DICOM dataset binary, WADO-RS metadata đọc từ đây
+- `version` — optimistic locking cho Correction module (tránh race condition concurrent update)
+- `study_size`, `series_size` — tổng file size cho admin dashboard
+- `num_studies` trên Patient — denormalized count
+- `institution`, `station_name`, `sending_aet` trên Series — tracking máy chụp nào gửi
+- Instance giữ **lean** (~300 bytes/row) — không có dicom_attrs vì 29 tỷ rows, đọc file header khi cần
+
 ```sql
 -- Patient table (không partition, < 10M rows)
 CREATE TABLE patient (
@@ -180,6 +188,8 @@ CREATE TABLE patient (
     ) STORED,
     birth_date      DATE,
     sex             CHAR(1),
+    num_studies     INT DEFAULT 0,                    -- dcm4chee: denormalized count
+    version         INT DEFAULT 0,                    -- dcm4chee: optimistic locking
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -199,8 +209,11 @@ CREATE TABLE study (
     modalities_in_study VARCHAR(100),
     num_series          INT DEFAULT 0,
     num_instances       INT DEFAULT 0,
+    study_size          BIGINT DEFAULT 0,             -- dcm4chee: tổng file size (bytes)
+    dicom_attrs         BYTEA,                        -- dcm4chee: full DICOM dataset binary
+    version             INT DEFAULT 0,                -- dcm4chee: optimistic locking
     patient_fk          BIGINT NOT NULL,
-    patient_id          VARCHAR(64) NOT NULL,      -- denormalized for common queries
+    patient_id          VARCHAR(64) NOT NULL,          -- denormalized for common queries
     created_at          TIMESTAMPTZ DEFAULT now(),
     updated_at          TIMESTAMPTZ DEFAULT now()
 );
@@ -218,17 +231,25 @@ CREATE TABLE series (
     modality             VARCHAR(16) NOT NULL,
     series_description   VARCHAR(1024),
     body_part            VARCHAR(64),
+    institution          VARCHAR(200),                 -- dcm4chee: institution name
+    station_name         VARCHAR(200),                 -- dcm4chee: tên máy chụp
+    sending_aet          VARCHAR(64),                  -- dcm4chee: AE title máy gửi
     num_instances        INT DEFAULT 0,
+    series_size          BIGINT DEFAULT 0,             -- dcm4chee: tổng file size (bytes)
+    dicom_attrs          BYTEA,                        -- dcm4chee: full DICOM dataset binary
+    version              INT DEFAULT 0,                -- dcm4chee: optimistic locking
     study_fk             BIGINT NOT NULL,
-    study_instance_uid   VARCHAR(64) NOT NULL,      -- denormalized
+    study_instance_uid   VARCHAR(64) NOT NULL,          -- denormalized
     created_at           TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE UNIQUE INDEX idx_series_uid ON series (series_instance_uid);
 CREATE INDEX idx_series_study ON series (study_instance_uid);
+CREATE INDEX idx_series_modality ON series (modality);
+CREATE INDEX idx_series_station ON series (station_name) WHERE station_name IS NOT NULL;
 
 -- Instance table: PARTITION BY RANGE (created_date) — monthly
--- Lean schema: ~300 bytes/row, không có JSONB metadata
+-- LEAN schema: ~300 bytes/row — KHÔNG có dicom_attrs (29 tỷ rows, đọc file header khi cần)
 -- 29B rows (10 năm) / 120 partitions = 240M rows/partition
 CREATE TABLE instance (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY,
