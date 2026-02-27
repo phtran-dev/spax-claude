@@ -101,7 +101,9 @@ spax-claude/
 │   │   ├── QidoController.java            # QIDO-RS: GET /dicomweb/studies, series, instances
 │   │   ├── WadoController.java            # WADO-RS: GET /dicomweb/studies/{uid}/...
 │   │   ├── StowController.java            # STOW-RS: POST /dicomweb/studies (standard compliant)
-│   │   ├── DicomJsonBuilder.java          # Build DICOM JSON response (PS3.18)
+│   │   ├── DicomJsonBuilder.java          # Build DICOM JSON từ DB records (PS3.18, dùng cho QIDO)
+│   │   ├── DicomMetadataBuilder.java      # Interface: build + cache metadata JSON từ DICOM files
+│   │   ├── SeriesMetadataBuilder.java     # Impl: build series-level metadata cache file
 │   │   └── QueryBuilder.java             # Dynamic SQL from QIDO query params
 │   ├── admin/
 │   │   ├── CorrectionController.java      # PUT patient/study metadata + xem audit log
@@ -332,6 +334,9 @@ CREATE TABLE series (
     version              INT DEFAULT 0,
     compress_tsuid       VARCHAR(64),                  -- transfer syntax hiện tại sau nén
     compress_time        TIMESTAMPTZ,
+    metadata_volume_id   INT,                          -- volume chứa pre-built metadata cache file
+    metadata_path        VARCHAR(512),                 -- path đến file JSON (DICOM JSON array, PS3.18)
+                                                       -- NULL = chưa build hoặc bị invalidate
     study_fk             BIGINT NOT NULL,
     study_instance_uid   VARCHAR(64) NOT NULL,         -- denormalized
     created_at           TIMESTAMPTZ DEFAULT now()
@@ -1115,7 +1120,7 @@ POST /api/v1/admin/lifecycle/rules
 | 8 | Ingest pipeline (controller + service + consumer) | #2,3,5,6,7 | 4 |
 | 9 | Bulk insert repository | #2,3 | 1 |
 | 10 | DICOMWeb QIDO-RS | #2,3,9 | 3 |
-| 11 | DICOMWeb WADO-RS | #2,3,5 | 1 |
+| 11 | DICOMWeb WADO-RS + DicomMetadataBuilder (interface + SeriesMetadataBuilder) | #2,3,5,7 | 3 |
 | 12 | DICOMWeb STOW-RS | #8 | 1 |
 | 13 | Admin: Correction + Audit | #2,3,5,7 | 4 |
 | 14 | Admin: Study management + System info | #2,3 | 3 |
