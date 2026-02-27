@@ -63,7 +63,8 @@ spax-claude/
 │   │   ├── VolumeManager.java             # Volume registry + active volume selection
 │   │   ├── VolumeController.java          # Admin API quản lý volumes
 │   │   ├── StoreResult.java              # Value object (volumeId + path)
-│   │   └── StorageProvider.java           # SPI interface cho từng loại storage
+│   │   ├── StorageProvider.java           # SPI interface cho từng loại storage
+│   │   └── StoragePathResolver.java       # Resolve path template → relative path
 │   ├── lifecycle/
 │   │   ├── LifecycleRule.java             # Entity: rule chuyển file giữa volumes
 │   │   ├── LifecycleService.java          # Evaluate rules + migrate files
@@ -112,6 +113,12 @@ spax-claude/
 │   │   ├── LifecycleController.java       # CRUD lifecycle rules
 │   │   ├── SystemInfoController.java      # Disk usage, DB stats, queue status
 │   │   └── StudyAdminController.java      # Xóa study, merge patient, ...
+│   ├── compression/
+│   │   ├── CompressionType.java           # Enum: JPEG_LS_LOSSLESS, JPEG_2000_LOSSLESS, JPEG_BASELINE, JPEG_2000_LOSSY
+│   │   ├── DicomCompressor.java           # dcm4che Transcoder wrapper (bytes in → bytes out)
+│   │   ├── CompressionTask.java           # JPA entity cho compression_task table
+│   │   ├── CompressionService.java        # Business logic: tạo task, async worker, update DB
+│   │   └── CompressionController.java     # REST API: manual trigger + xem tiến độ
 │   └── schema/
 │       └── migration/
 │           └── V1__init.sql               # Flyway migration for tenant schema
@@ -136,6 +143,7 @@ Dependencies:
 - `spring-boot-starter-data-redis` (Redis Streams)
 - `dcm4che-core` (DICOM parsing)
 - `dcm4che-json` (DICOM JSON cho DICOMWeb)
+- `dcm4che-imageio` + `dcm4che-imageio-opencv` (DICOM transcoding: JPEG-LS, JPEG 2000, JPEG Baseline)
 - `org.flywaydb:flyway-core` (schema migration)
 - `org.apache.jclouds:jclouds-blobstore` (storage abstraction)
 - `org.apache.jclouds.provider:aws-s3` (Amazon S3)
@@ -170,17 +178,91 @@ CREATE TABLE tenant (
 - Không dùng DICOM StudyDate làm partition key (unreliable, máy chụp có thể gửi sai/thiếu)
 
 **Thiết kế lấy ý tưởng từ dcm4chee arc-light:**
-- `dicom_attrs BYTEA` trên Study/Series — lưu full DICOM dataset binary, WADO-RS metadata đọc từ đây
 - `version` — optimistic locking cho Correction module (tránh race condition concurrent update)
 - `study_size`, `series_size` — tổng file size cho admin dashboard
 - `num_studies` trên Patient — denormalized count
 - `institution`, `station_name`, `sending_aet` trên Series — tracking máy chụp nào gửi
-- Instance giữ **lean** (~300 bytes/row) — không có dicom_attrs vì 29 tỷ rows, đọc file header khi cần
+- `compress_tsuid`, `compress_time` trên Series — theo dõi trạng thái nén (lấy ý từ dcm4chee `series.compress_tsuid`)
+- `last_accessed_at` trên Study — cho lifecycle condition `LAST_ACCESS_DAYS`
+- Study/Series/Instance đều **KHÔNG có `dicom_attrs`** — QIDO-RS dùng indexed columns, WADO-RS metadata đọc trực tiếp từ DICOM file (skip pixel data). File là source of truth.
+
+**Không lấy từ dcm4chee** (SPAX đơn giản hơn):
+- Không `dicom_attrs BYTEA` — không cần, QIDO dùng indexed columns, WADO dùng file
+- Không `completeness`, `rejection_state`, `expiration_state` — SPAX không có workflow phức tạp
+- Không bảng `location` riêng — SPAX dùng inline `volume_id` + `storage_path` trong instance
+- Không bảng `dicomattrs`, `metadata` riêng — file DICOM là metadata source
+- Không bảng `person_name`, `soundex_code` — TSVECTOR đủ cho SPAX
+
+**Unique key strategy — PID và DICOM UID đều không reliable trong thực tế:**
+
+Hai vấn đề thực tế:
+1. **PID rỗng/null** — ca cấp cứu, không kịp nhập
+2. **PID trùng 2 bệnh nhân khác nhau** — không dùng worklist, KTV nhập tay → nhập sai, nhập trùng
+3. **StudyUID/SeriesUID/SOPInstanceUID trùng giữa các máy** — máy cũ/rẻ/lỗi generate UID theo clock hoặc counter, reset → trùng UID. Đặc biệt phổ biến ở các cơ sở dùng máy clone firmware
+
+Hậu quả nếu chỉ dùng DICOM UID làm unique key:
+```
+Patient A (PID=111) → StudyUID=1.2.3 → stored
+Patient B (PID=222) → StudyUID=1.2.3 (máy lỗi) → ON CONFLICT DO UPDATE
+→ Study của A bị ghi đè bởi data của B → DATA LOSS, không ai biết
+```
+
+**Thực tế: StudyUID, SeriesUID, SOPInstanceUID đều có thể bị trùng** — máy cũ/rẻ/clone firmware. Không level nào đáng tin tuyệt đối.
+
+**SPAX dùng chiến lược "cascade correctness qua BIGINT FK":**
+
+`public_id = SHA1(...)` chỉ cần ở 2 level đầu để xác định đúng patient/study. Từ đó, series/instance dùng BIGINT FK (đã được resolve đúng) làm composite unique — collision trở thành "resend hợp lệ".
+
+| Table | Unique key | Lý do |
+|---|---|---|
+| patient | `public_id = SHA1(pid)` | Dedup patient |
+| study | `public_id = SHA1(pid \| studyUid)` | **PID bắt buộc**: phân biệt 2 bệnh nhân có cùng StudyUID |
+| series | `UNIQUE(study_fk, series_uid)` | `study_fk` (BIGINT) đã đúng → collision cùng study = resend |
+| instance | `UNIQUE(series_fk, sop_uid, created_date)` | `series_fk` (BIGINT) đã đúng → collision = resend |
+
+Ví dụ: 2 bệnh nhân có cùng StudyUID=A và SeriesUID=B:
+```
+Patient1 → study.public_id=SHA1("111|A") → study.id=101
+Patient2 → study.public_id=SHA1("222|A") → study.id=102
+
+Series Patient1: UNIQUE(study_fk=101, series_uid=B) → OK
+Series Patient2: UNIQUE(study_fk=102, series_uid=B) → OK (khác study_fk)
+```
+
+**Correction (sửa PID): chỉ update 2 table:**
+```
+1. UPDATE patient SET patient_id=?, public_id=SHA1(?)   ← 1 row, tức thì
+2. Background job: UPDATE study SET public_id=SHA1(new_pid|study_uid)
+                  WHERE patient_fk=?                     ← N rows, async
+3. Series/Instance: KHÔNG cần update gì                 ← BIGINT FK không đổi
+```
+File path dùng `AttributesFormat` (tag-based, không phụ thuộc PID) → **file không di chuyển khi sửa PID**.
+
+**Chiến lược xử lý PID tại `IndexingConsumer`:**
+```
+PID rỗng/null
+  → patient_id = "NOPID_{studyUid[0..16]}", is_provisional = true
+  → public_id = SHA1("NOPID_{studyUid[0..16]}")
+
+PID có giá trị, public_id chưa có trong DB
+  → tạo patient mới, is_provisional = false
+
+PID có giá trị, public_id đã có → cùng bệnh nhân
+  → upsert patient (cập nhật name nếu khác)
+
+Study public_id = SHA1(patient_id | study_uid)
+  → nếu chưa có → INSERT study mới
+  → nếu đã có → cùng study, cùng bệnh nhân → upsert (resend)
+  → StudyUID trùng nhưng PID khác → public_id khác → INSERT study mới → đúng
+```
 
 ```sql
 -- Patient table (không partition, < 10M rows)
+-- public_id = SHA1(patient_id) — unique key cho dedup, tách biệt với internal PK
+-- is_provisional = true khi: PID rỗng HOẶC nghi ngờ PID collision (tên khác biệt)
 CREATE TABLE patient (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    public_id       CHAR(40) NOT NULL,                -- SHA1(patient_id), Orthanc-style
     patient_id      VARCHAR(64) NOT NULL,
     patient_name    VARCHAR(324),
     patient_name_search TSVECTOR GENERATED ALWAYS AS (
@@ -188,20 +270,26 @@ CREATE TABLE patient (
     ) STORED,
     birth_date      DATE,
     sex             CHAR(1),
-    num_studies     INT DEFAULT 0,                    -- dcm4chee: denormalized count
-    version         INT DEFAULT 0,                    -- dcm4chee: optimistic locking
+    is_provisional  BOOLEAN DEFAULT false,            -- true = cần human review
+    num_studies     INT DEFAULT 0,
+    version         INT DEFAULT 0,                    -- optimistic locking cho correction
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE UNIQUE INDEX idx_patient_pid ON patient (patient_id);
+CREATE UNIQUE INDEX idx_patient_public_id ON patient (public_id);
+CREATE INDEX idx_patient_pid ON patient (patient_id);
 CREATE INDEX idx_patient_name_fts ON patient USING GIN (patient_name_search);
+CREATE INDEX idx_patient_provisional ON patient (is_provisional) WHERE is_provisional = true;
 
 -- Study table (không partition, < 500M rows)
+-- public_id = SHA1(patient_id | study_uid) — BẮT BUỘC có PID để handle UID collision giữa bệnh nhân khác nhau
+-- Ví dụ: 2 máy chụp khác nhau sinh ra cùng StudyUID nhưng PID khác → public_id khác → 2 study riêng → đúng
 CREATE TABLE study (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    study_instance_uid  VARCHAR(64) NOT NULL,
-    study_date          VARCHAR(16),              -- raw DICOM tag, nullable (unreliable)
+    public_id           CHAR(40) NOT NULL,            -- SHA1(patient_id + "|" + study_uid)
+    study_instance_uid  VARCHAR(64) NOT NULL,          -- raw DICOM tag, có thể trùng giữa các máy
+    study_date          VARCHAR(16),
     study_time          VARCHAR(14),
     study_description   VARCHAR(1024),
     accession_number    VARCHAR(64),
@@ -209,21 +297,26 @@ CREATE TABLE study (
     modalities_in_study VARCHAR(100),
     num_series          INT DEFAULT 0,
     num_instances       INT DEFAULT 0,
-    study_size          BIGINT DEFAULT 0,             -- dcm4chee: tổng file size (bytes)
-    dicom_attrs         BYTEA,                        -- dcm4chee: full DICOM dataset binary
-    version             INT DEFAULT 0,                -- dcm4chee: optimistic locking
+    study_size          BIGINT DEFAULT 0,
+    version             INT DEFAULT 0,                -- optimistic locking cho correction
     patient_fk          BIGINT NOT NULL,
-    patient_id          VARCHAR(64) NOT NULL,          -- denormalized for common queries
+    patient_id          VARCHAR(64) NOT NULL,          -- denormalized for QIDO queries
     created_at          TIMESTAMPTZ DEFAULT now(),
-    updated_at          TIMESTAMPTZ DEFAULT now()
+    updated_at          TIMESTAMPTZ DEFAULT now(),
+    last_accessed_at    TIMESTAMPTZ                    -- cho lifecycle LAST_ACCESS_DAYS
 );
 
-CREATE UNIQUE INDEX idx_study_uid ON study (study_instance_uid);
-CREATE INDEX idx_study_patient ON study (patient_id);
+CREATE UNIQUE INDEX idx_study_public_id ON study (public_id);
+CREATE INDEX idx_study_uid ON study (study_instance_uid);  -- non-unique: có thể trùng
+CREATE INDEX idx_study_patient ON study (patient_fk);
 CREATE INDEX idx_study_accession ON study (accession_number) WHERE accession_number IS NOT NULL;
 CREATE INDEX idx_study_created ON study (created_at DESC);
 
 -- Series table (không partition, < 600M rows)
+-- Unique key: UNIQUE(study_fk, series_uid) — study_fk đã được resolve đúng qua public_id ở study level
+-- SeriesUID trùng giữa 2 bệnh nhân → study_fk khác → không conflict
+-- SeriesUID trùng trong cùng 1 study → collision hợp lệ → ON CONFLICT DO UPDATE
+-- Correction PID: KHÔNG cần update series gì cả (study_fk là BIGINT, không đổi)
 CREATE TABLE series (
     id                   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     series_instance_uid  VARCHAR(64) NOT NULL,
@@ -231,26 +324,30 @@ CREATE TABLE series (
     modality             VARCHAR(16) NOT NULL,
     series_description   VARCHAR(1024),
     body_part            VARCHAR(64),
-    institution          VARCHAR(200),                 -- dcm4chee: institution name
-    station_name         VARCHAR(200),                 -- dcm4chee: tên máy chụp
-    sending_aet          VARCHAR(64),                  -- dcm4chee: AE title máy gửi
+    institution          VARCHAR(200),
+    station_name         VARCHAR(200),
+    sending_aet          VARCHAR(64),
     num_instances        INT DEFAULT 0,
-    series_size          BIGINT DEFAULT 0,             -- dcm4chee: tổng file size (bytes)
-    dicom_attrs          BYTEA,                        -- dcm4chee: full DICOM dataset binary
-    version              INT DEFAULT 0,                -- dcm4chee: optimistic locking
+    series_size          BIGINT DEFAULT 0,
+    version              INT DEFAULT 0,
+    compress_tsuid       VARCHAR(64),                  -- transfer syntax hiện tại sau nén
+    compress_time        TIMESTAMPTZ,
     study_fk             BIGINT NOT NULL,
-    study_instance_uid   VARCHAR(64) NOT NULL,          -- denormalized
+    study_instance_uid   VARCHAR(64) NOT NULL,         -- denormalized
     created_at           TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE UNIQUE INDEX idx_series_uid ON series (series_instance_uid);
-CREATE INDEX idx_series_study ON series (study_instance_uid);
+CREATE UNIQUE INDEX idx_series_unique ON series (study_fk, series_instance_uid);
+CREATE INDEX idx_series_uid ON series (series_instance_uid);
 CREATE INDEX idx_series_modality ON series (modality);
 CREATE INDEX idx_series_station ON series (station_name) WHERE station_name IS NOT NULL;
 
 -- Instance table: PARTITION BY RANGE (created_date) — monthly
--- LEAN schema: ~300 bytes/row — KHÔNG có dicom_attrs (29 tỷ rows, đọc file header khi cần)
--- 29B rows (10 năm) / 120 partitions = 240M rows/partition
+-- LEAN schema: ~300 bytes/row
+-- Dedup key: (series_fk, sop_instance_uid) — series_fk đã được resolve đúng, sopUID trùng = resend
+-- PostgreSQL yêu cầu partition key trong UNIQUE index → không dùng DB-level UNIQUE constraint
+-- Thay vào đó: BulkInsertRepository filter SOPUIDs đã tồn tại trước khi INSERT (query by series_fk + sop_uid)
+-- Correction PID: KHÔNG cần update instance gì cả
 CREATE TABLE instance (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY,
     sop_instance_uid    VARCHAR(64) NOT NULL,
@@ -262,16 +359,15 @@ CREATE TABLE instance (
     volume_id           INT NOT NULL,
     storage_path        VARCHAR(512) NOT NULL,
     series_fk           BIGINT NOT NULL,
-    series_instance_uid VARCHAR(64) NOT NULL,        -- denormalized
+    series_instance_uid VARCHAR(64) NOT NULL,         -- denormalized
     study_instance_uid  VARCHAR(64) NOT NULL,         -- denormalized
-    created_date        DATE NOT NULL DEFAULT CURRENT_DATE,  -- partition key (system-generated)
+    created_date        DATE NOT NULL DEFAULT CURRENT_DATE,
     CONSTRAINT pk_instance PRIMARY KEY (id, created_date)
 ) PARTITION BY RANGE (created_date);
--- Monthly partitions auto-created by AutoPartitionService (12 tháng trước)
 
-CREATE INDEX idx_instance_sop ON instance (sop_instance_uid);
-CREATE INDEX idx_instance_series ON instance (series_instance_uid);
-CREATE INDEX idx_instance_study ON instance (study_instance_uid);
+CREATE INDEX idx_instance_dedup ON instance (series_fk, sop_instance_uid);  -- application-level dedup
+CREATE INDEX idx_instance_sop ON instance (sop_instance_uid, created_date);
+CREATE INDEX idx_instance_study ON instance (study_instance_uid, created_date);
 ```
 
 ---
@@ -374,6 +470,11 @@ CREATE TABLE storage_volume (
     total_bytes     BIGINT,
     used_bytes      BIGINT DEFAULT 0,
     -- Cloud credentials (nullable, chỉ dùng cho cloud volumes)
+    path_template   VARCHAR(500),                  -- NULL = dùng default template từ config
+                                                   -- Ví dụ local FS: '{tenant}/{hash2}/{hash4}/{studyUid}/{seriesUid}/{sopUid}.dcm'
+                                                   -- Ví dụ S3:       '{tenant}/{studyUid}/{seriesUid}/{sopUid}.dcm'
+                                                   -- Ví dụ date:     '{tenant}/{year}/{month}/{sopUid}.dcm'
+    -- Cloud credentials (nullable, chỉ dùng cho cloud volumes)
     cloud_endpoint  VARCHAR(500),                  -- custom endpoint (MinIO, etc.)
     cloud_region    VARCHAR(50),
     cloud_bucket    VARCHAR(200),
@@ -388,11 +489,13 @@ CREATE TABLE lifecycle_rule (
     id              SERIAL PRIMARY KEY,
     name            VARCHAR(100) NOT NULL,
     enabled         BOOLEAN DEFAULT true,
-    source_tier     VARCHAR(10) NOT NULL,          -- 'HOT'
-    target_tier     VARCHAR(10) NOT NULL,          -- 'WARM'
-    condition_type  VARCHAR(30) NOT NULL,           -- 'STUDY_AGE_DAYS', 'LAST_ACCESS_DAYS'
-    condition_value INT NOT NULL,                   -- 180 (days)
-    delete_source   BOOLEAN DEFAULT true,           -- xóa file ở source sau khi copy xong
+    action_type     VARCHAR(20) DEFAULT 'MIGRATE',  -- 'MIGRATE' | 'COMPRESS'
+    source_tier     VARCHAR(10) NOT NULL,           -- filter tier cần xử lý
+    target_tier     VARCHAR(10),                    -- đích (chỉ dùng khi MIGRATE)
+    condition_type  VARCHAR(30) NOT NULL,            -- 'STUDY_AGE_DAYS', 'LAST_ACCESS_DAYS'
+    condition_value INT NOT NULL,                    -- 180 (days)
+    delete_source   BOOLEAN DEFAULT true,            -- xóa source sau copy (chỉ MIGRATE)
+    compression_type VARCHAR(50),                   -- e.g. 'JPEG_LS_LOSSLESS' (chỉ COMPRESS)
     tenant_code     VARCHAR(50),                    -- NULL = áp dụng tất cả tenant
     created_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -427,6 +530,13 @@ CREATE INDEX idx_migration_status ON migration_task (status) WHERE status != 'CO
 - Auto-detect đĩa đầy cho LOCAL volumes (check free space trước khi ghi)
 - `getProvider(int volumeId)` → trả StorageProvider tương ứng (Local hoặc JCloud)
 
+**StoragePathResolver.java**:
+- Wrapper mỏng quanh `org.dcm4che3.util.AttributesFormat` (từ `dcm4che-core`)
+- Input: `StorageVolume` + `Attributes` (DICOM object từ DicomParser) + `tenantCode`
+- Output: `String relativePath` = `tenantCode + "/" + attributesFormat.format(attrs)`
+- Lấy template từ `volume.path_template`, fallback về `spax.storage.default-path-template`
+- Validate khi volume được tạo: template phải chứa `{00080018}` (SOP UID = uniqueness guarantee)
+
 **StorageService.java** (facade):
 ```java
 public interface StorageService {
@@ -437,10 +547,43 @@ public interface StorageService {
 }
 ```
 
-**Relative path format** (giống nhau cho mọi volume/provider):
+**Relative path** được resolve bởi `StoragePathResolver`, tái sử dụng `AttributesFormat` từ `dcm4che-core` (đã có trong dependency).
+
+**Syntax**: dcm4chee's `AttributesFormat` — dùng DICOM tag number 8 chữ số hex:
+
+| Biểu thức | Ý nghĩa |
+|---|---|
+| `{00080018}` | SOP Instance UID (raw) |
+| `{0020000D}` | Study Instance UID (raw) |
+| `{0020000E}` | Series Instance UID (raw) |
+| `{00080018,hash}` | Java hashCode của SOP UID → hex (sharding) |
+| `{now,date,yyyy/MM/dd}` | Ngày ingest |
+| `{00080018,md5}` | MD5 hash của SOP UID — base32, 26 ký tự |
+| `{00080018,slice,0,2}` | 2 ký tự đầu của SOP UID |
+
+Default template (giống dcm4chee default):
 ```
-{tenantCode}/{hash[0:2]}/{hash[2:4]}/{studyUid}/{seriesUid}/{sopUid}.dcm
+{now,date,yyyy/MM/dd}/{0020000D,hash}/{0020000E,hash}/{00080018,hash}
 ```
+
+SPAX prepend `{tenantCode}/` vào trước kết quả → full path ví dụ:
+```
+hospital_a/2026/02/26/a1b2c3d4/e5f6a7b8/c9d0e1f2
+```
+
+Ví dụ templates khác:
+```
+# Raw UID — dễ lookup thủ công
+{0020000D}/{0020000E}/{00080018}
+
+# Date-based — dễ archive theo tháng
+{now,date,yyyy/MM/dd}/{00080018,hash}
+```
+
+Template config tại `storage_volume.path_template` (per volume). `NULL` → dùng `spax.storage.default-path-template`.
+`AttributesFormat.format(attrs)` nhận thẳng `Attributes` object từ `DicomParser` — không cần convert.
+Path resolved tại ingest time, lưu vào `instance.storage_path` → đổi template sau không ảnh hưởng file cũ.
+Validate: template phải produce unique path per instance (phải chứa `{00080018}` hoặc dẫn xuất từ nó).
 
 **Admin API cho volume management:**
 | Endpoint | Purpose |
@@ -765,6 +908,23 @@ CREATE TABLE file_correction_task (
     created_at      TIMESTAMPTZ DEFAULT now(),
     completed_at    TIMESTAMPTZ
 );
+
+CREATE TABLE compression_task (
+    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    study_instance_uid  VARCHAR(64) NOT NULL,
+    compression_type    VARCHAR(50) NOT NULL,   -- JPEG_LS_LOSSLESS, JPEG_BASELINE, ...
+    total_files         INT NOT NULL,
+    processed_files     INT DEFAULT 0,
+    failed_files        INT DEFAULT 0,
+    status              VARCHAR(20) DEFAULT 'PENDING',  -- PENDING, IN_PROGRESS, COMPLETED, FAILED
+    triggered_by        VARCHAR(100),           -- null = auto (lifecycle rule), else username
+    rule_id             INT,                    -- ref lifecycle_rule.id nếu từ auto
+    error_summary       TEXT,
+    created_at          TIMESTAMPTZ DEFAULT now(),
+    completed_at        TIMESTAMPTZ
+);
+CREATE INDEX idx_compression_task_study ON compression_task (study_instance_uid);
+CREATE INDEX idx_compression_task_status ON compression_task (status) WHERE status != 'COMPLETED';
 ```
 
 **CorrectionController.java:**
@@ -836,6 +996,111 @@ Cho mỗi DICOM file trong study:
 
 ---
 
+## Phase 7: DICOM Compression
+
+### 7.1 Tổng quan
+
+Hai mode nén ảnh DICOM:
+1. **Manual**: Admin trigger nén cho 1 study cụ thể qua REST API
+2. **Auto**: Lifecycle rule với `action_type=COMPRESS` — tự động nén sau N ngày
+
+Nguyên tắc cốt lõi:
+- File được nén **tại chỗ** (cùng storage path, cùng volume) — không di chuyển file
+- File gốc bị xóa, thay bằng file đã nén
+- `transfer_syntax_uid` trong bảng `instance` được cập nhật
+- Idempotent: instance đã có đúng transfer syntax thì skip
+
+### 7.2 Compression types hỗ trợ
+
+```java
+public enum CompressionType {
+    JPEG_LS_LOSSLESS  ("1.2.840.10008.1.2.4.80"),  // lossless, tiết kiệm ~40-60%
+    JPEG_2000_LOSSLESS("1.2.840.10008.1.2.4.90"),  // lossless, tiết kiệm ~40-60%
+    JPEG_BASELINE     ("1.2.840.10008.1.2.4.50"),  // lossy ~70-85% nhỏ hơn
+    JPEG_2000_LOSSY   ("1.2.840.10008.1.2.4.91"); // lossy ~90% nhỏ hơn
+}
+```
+
+### 7.3 DicomCompressor.java
+
+Dùng dcm4che `Transcoder` API:
+- Input: `InputStream` DICOM file + `CompressionType`
+- Output: `byte[]` DICOM đã nén + kích thước mới
+- Không tương tác DB hay storage — chỉ xử lý bytes
+- Dependency: `dcm4che-imageio` + `dcm4che-imageio-opencv` (native codecs bundled)
+
+### 7.4 CompressionService.java
+
+**Manual flow:**
+```
+POST /api/v1/{tenant}/admin/studies/{studyUid}/compress
+  {"compressionType": "JPEG_LS_LOSSLESS"}
+  → Query tất cả instances của study (volume_id, storage_path, transfer_syntax_uid)
+  → Tạo compression_task (status=PENDING, total_files=N)
+  → Submit vào virtual thread executor (non-blocking)
+  → Return taskId ngay
+
+Worker:
+  For each instance:
+    1. Skip nếu transfer_syntax_uid == target (idempotent)
+    2. storageService.read(volumeId, path) → InputStream
+    3. dicomCompressor.compress(stream, type) → byte[]
+    4. storageService.delete(volumeId, path)        ← xóa file gốc
+    5. storageService.write(volumeId, path, bytes)  ← ghi file nén (cùng path)
+    6. UPDATE instance SET transfer_syntax_uid=?, file_size=?
+    7. processed_files++
+  After all done:
+    → Recalculate: UPDATE study/series SET study_size/series_size = SUM(instance.file_size)
+    → Mark task COMPLETED, completed_at = now()
+```
+
+**Auto flow (Lifecycle rule với action_type=COMPRESS):**
+```
+LifecycleService (evaluate rules):
+  → Filter rules có action_type='COMPRESS'
+  → Query instances ở source_tier thỏa điều kiện tuổi
+  → Skip instances đã có target transfer syntax
+  → Group by study_instance_uid
+  → Mỗi study: compressionService.createTask(studyUid, compressionType, ruleId, triggeredBy=null)
+```
+
+### 7.5 CompressionController.java
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/{tenant}/admin/studies/{studyUid}/compress` | Manual trigger, body: `{"compressionType": "JPEG_LS_LOSSLESS"}` |
+| `GET /api/v1/{tenant}/admin/compressions` | Liệt kê tasks (filter theo status) |
+| `GET /api/v1/{tenant}/admin/compressions/{taskId}` | Chi tiết + tiến độ (processed/total) |
+
+### 7.6 Ví dụ Lifecycle Rule cho auto-compression
+
+```bash
+# Nén lossless sau 3 tháng (file ở HOT tier)
+POST /api/v1/admin/lifecycle/rules
+{
+  "name": "Compress HOT after 3 months",
+  "actionType": "COMPRESS",
+  "sourceTier": "HOT",
+  "conditionType": "STUDY_AGE_DAYS",
+  "conditionValue": 90,
+  "compressionType": "JPEG_LS_LOSSLESS"
+}
+
+# Sau đó có thể thêm rule migrate sang WARM tier
+POST /api/v1/admin/lifecycle/rules
+{
+  "name": "Move to WARM after 6 months",
+  "actionType": "MIGRATE",
+  "sourceTier": "HOT",
+  "targetTier": "WARM",
+  "conditionType": "STUDY_AGE_DAYS",
+  "conditionValue": 180,
+  "deleteSource": true
+}
+```
+
+---
+
 ## Implementation Order
 
 | Order | Component | Dependencies | Est. Files |
@@ -858,6 +1123,8 @@ Cho mỗi DICOM file trong study:
 | 16 | Data Lifecycle (rules + migration job) | #2,5 | 4 |
 | 17 | Self-management (partition, disk, recovery) | #2,3 | 3 |
 | 18 | Health endpoint | All | 1 |
+| 19 | Compression module (CompressionType, DicomCompressor, CompressionTask, CompressionService, CompressionController) | #5, #13 | 5 |
+| 20 | Lifecycle extend: action_type=COMPRESS | #16, #19 | 1 |
 
 ---
 
@@ -891,6 +1158,8 @@ spax:
     # Volumes được quản lý trong DB (bảng storage_volume)
     # Dùng Admin API để thêm/sửa volumes
     disk-space-threshold-mb: 5120   # cảnh báo khi ổ đĩa còn < 5GB free
+    default-path-template: "{tenant}/{hash2}/{hash4}/{studyUid}/{seriesUid}/{sopUid}.dcm"
+    # Override per volume trong DB (storage_volume.path_template)
   ingest:
     batch-size: 200              # instances per DB flush
     flush-interval-ms: 2000      # max time between flushes
