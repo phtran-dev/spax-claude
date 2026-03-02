@@ -6,6 +6,7 @@ Implement lifecycle rule engine: tự động migrate files giữa storage tiers
 ## Dependencies
 - SPEC-02 (schema — lifecycle_rule, migration_task tables)
 - SPEC-05 (StorageService, VolumeManager)
+- SPEC-21 (WadoRsCacheService — cache invalidation sau migration)
 
 ## Files cần tạo
 
@@ -44,6 +45,8 @@ public class LifecycleService {
     @Autowired private JdbcTemplate jdbcTemplate;  // public schema
     @Autowired private VolumeManager volumeManager;
     @Autowired private StorageService storageService;
+    @Autowired private WadoRsCacheService wadoRsCacheService;
+    @Autowired private CacheManager cacheManager;
 
     /**
      * Evaluate all enabled MIGRATE rules.
@@ -186,6 +189,13 @@ public class LifecycleService {
                 targetVolumeId, instanceId
             );
 
+            // 3b. Invalidate instance location cache (SPEC-21)
+            // Cache entry cũ có volume_id cũ → phải evict để next request load fresh
+            String seriesUid = jdbcTemplate.queryForObject(
+                "SELECT series_instance_uid FROM instance WHERE id = ?", String.class, instanceId
+            );
+            wadoRsCacheService.evictInstanceLocations(cacheManager, tenantCode, seriesUid);
+
             // 4. Delete source (if deleteSource configured)
             boolean deleteSource = (boolean) jdbcTemplate.queryForObject(
                 "SELECT delete_source FROM public.lifecycle_rule WHERE id = ?",
@@ -272,14 +282,13 @@ public class LifecycleService {
         );
     }
 
+    @Autowired private LifecycleRuleCacheService lifecycleRuleCacheService;
+
     private List<LifecycleRule> loadEnabledMigrateRules() {
-        return jdbcTemplate.query("""
-            SELECT * FROM public.lifecycle_rule
-            WHERE enabled = true AND action_type = 'MIGRATE'
-            ORDER BY id
-            """,
-            new BeanPropertyRowMapper<>(LifecycleRule.class)
-        );
+        // Dùng cache (SPEC-21) — lifecycle rules ít thay đổi, TTL 6 hours
+        return lifecycleRuleCacheService.getRulesByActionType("MIGRATE").stream()
+            .map(dto -> /* map LifecycleRuleDto → LifecycleRule entity */)
+            .toList();
     }
 }
 ```

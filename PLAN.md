@@ -36,6 +36,7 @@ Orthanc/Gateway → [Batch REST API] → SPAX → [Redis Streams] → [Indexing 
 | Local Storage | Java NIO | (JDK built-in) |
 | Build | Maven | 3.9.x |
 | Connection Pool | HikariCP | (Spring Boot default) |
+| Cache | Spring Cache + EhCache | 3.10.x (or Redis backend) |
 
 ---
 
@@ -50,7 +51,12 @@ spax-claude/
 │   │   ├── DataSourceConfig.java          # Multi-tenant datasource routing
 │   │   ├── RedisConfig.java               # Redis Streams config
 │   │   ├── StorageConfig.java             # Storage abstraction config
+│   │   ├── CacheConfig.java              # Spring Cache config (EhCache or Redis backend)
 │   │   └── WebConfig.java                 # CORS, multipart config
+│   ├── cache/
+│   │   ├── WadoRsCacheService.java        # Instance location + series metadata cache
+│   │   ├── TenantCacheService.java        # Active tenants cache (TTL 60s)
+│   │   └── LifecycleRuleCacheService.java # Lifecycle rules cache (TTL 6h)
 │   ├── tenant/
 │   │   ├── TenantContext.java             # ThreadLocal tenant holder
 │   │   ├── TenantInterceptor.java         # Extract tenant from request header/path
@@ -856,6 +862,8 @@ Tất cả 3 đường hội tụ vào cùng pipeline:
 | `GET /dicomweb/{tenant}/.../instances/{sopUid}/frames/{frames}` | `multipart/related` | Specific frames |
 
 **Flow**: Query DB for storage_path → Read file from storage → Stream to client
+
+**Caching (SPEC-21)**: `WadoRsCacheService` caches instance locations batch-loaded theo series. Khi OHIF load 1000 frames, chỉ 1 DB query (2-step: series FK → all instances) thay vì 1000 queries scan 12+ partitions. Backend: EhCache (default) hoặc Redis — configurable via `spax.cache.type`.
 
 ### 4.3 STOW-RS (Store - DICOMWeb standard)
 

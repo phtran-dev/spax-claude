@@ -10,6 +10,7 @@ Implement toàn bộ ingest pipeline: 3 đường nhận file → 1 queue → 1 
 - SPEC-06 (IngestQueue, IngestMessage)
 - SPEC-07 (DicomParser, DicomMetadata)
 - SPEC-09 (BulkInsertRepository — cần trước khi implement IndexingConsumer)
+- SPEC-21 (TenantCacheService, WadoRsCacheService — cached tenant list + cache invalidation)
 
 ## Files cần tạo
 
@@ -141,6 +142,9 @@ public class IndexingConsumer {
     @Autowired private StorageService storageService;
     @Autowired private BulkInsertRepository bulkInsertRepository;
     @Autowired private TenantManagementService tenantManagementService;
+    @Autowired private TenantCacheService tenantCacheService;         // SPEC-21
+    @Autowired private WadoRsCacheService wadoRsCacheService;         // SPEC-21
+    @Autowired private CacheManager cacheManager;                     // SPEC-21
 
     @Value("${spax.ingest.batch-size:200}")
     private int batchSize;
@@ -217,6 +221,23 @@ public class IndexingConsumer {
             // Batch upsert all parsed metadata in 1 transaction
             if (!parsed.isEmpty()) {
                 bulkInsertRepository.batchUpsert(parsed);
+
+                // Invalidate caches cho affected series/studies (SPEC-21)
+                // Khi resend images vào series đã có → cache cũ thiếu instances mới
+                Set<String> affectedSeriesUids = parsed.stream()
+                    .map(item -> item.dicom().seriesInstanceUid())
+                    .collect(Collectors.toSet());
+                Set<String> affectedStudyUids = parsed.stream()
+                    .map(item -> item.dicom().studyInstanceUid())
+                    .collect(Collectors.toSet());
+
+                wadoRsCacheService.evictInstanceLocations(cacheManager, tenantCode, affectedSeriesUids);
+                for (String seriesUid : affectedSeriesUids) {
+                    wadoRsCacheService.evictSeriesMetadataInfo(tenantCode, seriesUid);
+                }
+                for (String studyUid : affectedStudyUids) {
+                    wadoRsCacheService.evictSeriesByStudy(tenantCode, studyUid);
+                }
             }
 
         } finally {
@@ -242,8 +263,8 @@ public class IndexingConsumer {
     }
 
     private List<String> getActiveTenants() {
-        // TODO: Cache this with TTL 60s, query public.tenant WHERE active=true
-        return jdbcTemplate.queryForList("SELECT code FROM public.tenant WHERE active = true", String.class);
+        // Cached via TenantCacheService (SPEC-21) — TTL 60s, avoids DB hit every loop iteration
+        return tenantCacheService.getActiveTenantCodes();
     }
 
     private void sleepSafe(long ms) {

@@ -13,6 +13,7 @@ Implement WADO-RS endpoints để OHIF Viewer tải ảnh DICOM. Trọng tâm l�
 - SPEC-03 (TenantContext)
 - SPEC-05 (StorageService, VolumeManager)
 - SPEC-07 (DicomParser — dùng trong SeriesMetadataBuilder fallback)
+- SPEC-21 (WadoRsCacheService — cached instance location lookup)
 
 ## Files cần tạo
 
@@ -219,14 +220,18 @@ public class SeriesMetadataBuilder implements DicomMetadataBuilder {
 
 ### 3. `src/main/java/com/spax/dicomweb/WadoController.java`
 
+Dùng `WadoRsCacheService` (SPEC-21) thay vì query DB trực tiếp. Instance location được batch-load
+theo series và cache lại — 1000 frame requests chỉ cần 1 DB query thay vì 1000.
+
 ```java
 @RestController
 @RequestMapping("/dicomweb/{tenant}")
 public class WadoController {
 
-    @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private StorageService storageService;
-    @Autowired private VolumeManager volumeManager;
+    @Autowired private WadoRsCacheService wadoRsCacheService;
+    @Autowired private CacheManager cacheManager;
+    @Autowired private FrameRetrievalService frameRetrievalService;
 
     @Autowired
     @Qualifier("seriesMetadataBuilder")
@@ -266,15 +271,21 @@ public class WadoController {
     /**
      * GET /dicomweb/{tenant}/studies/{studyUid}/series/{seriesUid}/instances/{sopUid}
      * Returns: raw DICOM file bytes
+     *
+     * Dùng WadoRsCacheService: batch load toàn bộ series vào cache khi miss.
+     * seriesUid từ URL được dùng làm cache key — implicit validation.
      */
     @GetMapping(
         value = "/studies/{studyUid}/series/{seriesUid}/instances/{sopUid}",
         produces = "application/dicom"
     )
     public ResponseEntity<StreamingResponseBody> retrieveInstance(
+            @PathVariable String tenant,
+            @PathVariable String seriesUid,
             @PathVariable String sopUid) {
 
-        InstanceLocation loc = findInstance(sopUid);
+        WadoRsCacheService.InstanceLocation loc =
+            wadoRsCacheService.findInstance(cacheManager, tenant, seriesUid, sopUid);
         if (loc == null) return ResponseEntity.notFound().build();
 
         StreamingResponseBody body = outputStream -> {
@@ -288,67 +299,106 @@ public class WadoController {
             .body(body);
     }
 
-    // ─── FRAMES (pixel data) ──────────────────────────────────────────────
+    // ─── FRAMES (pixel data) — SPEC-22 ────────────────────────────────────
 
     /**
      * GET /dicomweb/{tenant}/.../instances/{sopUid}/frames/{frameList}
-     * OHIF gọi để lấy nội dung pixel data theo frame.
-     * frameList: "1" hoặc "1,2,3"
+     *
+     * OHIF gọi để lấy pixel data frames.
+     * frameList: "1" hoặc "1,3,5" (1-based, comma-separated).
+     *
+     * Returns: multipart/related — mỗi frame = 1 MIME part.
+     * - Uncompressed: Content-Type: application/octet-stream
+     * - Compressed: Content-Type: application/octet-stream; transfer-syntax={tsuid}
+     *
+     * Single-pass: 1 file open, 1 header parse cho tất cả frames (SPEC-22).
+     * Cache: batch load toàn bộ series → 1000 frame requests chỉ 1 DB query.
      */
     @GetMapping(value = "/studies/{studyUid}/series/{seriesUid}/instances/{sopUid}/frames/{frameList}")
     public ResponseEntity<StreamingResponseBody> retrieveFrames(
+            @PathVariable String tenant,
+            @PathVariable String seriesUid,
             @PathVariable String sopUid,
             @PathVariable String frameList) {
 
-        InstanceLocation loc = findInstance(sopUid);
+        // 1. Cache lookup (batch load series on miss)
+        WadoRsCacheService.InstanceLocation loc =
+            wadoRsCacheService.findInstance(cacheManager, tenant, seriesUid, sopUid);
         if (loc == null) return ResponseEntity.notFound().build();
 
-        String boundary = "frames_" + UUID.randomUUID().toString().replace("-", "");
+        // 2. Parse + sort frame list: "5,1,3" → [1, 3, 5]
+        List<Integer> frameNumbers;
+        try {
+            frameNumbers = Arrays.stream(frameList.split(","))
+                .map(String::trim)
+                .map(Integer::parseInt)
+                .sorted()
+                .toList();
+        } catch (NumberFormatException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (frameNumbers.isEmpty() || frameNumbers.getFirst() < 1) {
+            return ResponseEntity.badRequest().build();
+        }
 
+        // 3. Validate frame range
+        if (frameNumbers.getLast() > loc.numFrames()) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        // 4. Determine outer Content-Type header
+        String boundary = "frames_" + UUID.randomUUID().toString().replace("-", "");
+        FrameType frameType = FrameType.classify(loc.transferSyntaxUid(), loc.numFrames());
+        String contentType;
+        if (frameType.isCompressed()) {
+            contentType = "multipart/related; type=\"application/octet-stream; transfer-syntax="
+                + loc.transferSyntaxUid() + "\"; boundary=" + boundary;
+        } else {
+            contentType = "multipart/related; type=\"application/octet-stream\"; boundary=" + boundary;
+        }
+
+        // 5. Stream response (non-buffered, single-pass frame extraction)
         StreamingResponseBody body = outputStream -> {
-            // Simplified: trả toàn bộ file trong multipart wrapper
-            // TODO: proper frame extraction với dcm4che Transcoder khi cần
-            PrintWriter writer = new PrintWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8));
-            writer.print("\r\n--" + boundary + "\r\n");
-            writer.print("Content-Type: application/octet-stream\r\n\r\n");
-            writer.flush();
-            try (InputStream in = storageService.retrieve(loc.volumeId(), loc.storagePath())) {
-                in.transferTo(outputStream);
-            }
-            writer.print("\r\n--" + boundary + "--\r\n");
-            writer.flush();
+            frameRetrievalService.writeFrames(loc, frameNumbers, outputStream, boundary);
         };
 
         return ResponseEntity.ok()
-            .contentType(MediaType.parseMediaType(
-                "multipart/related; type=\"application/octet-stream\"; boundary=" + boundary
-            ))
+            .contentType(MediaType.parseMediaType(contentType))
             .body(body);
     }
 
     // ─── RETRIEVE STUDY / SERIES (multipart/related) ──────────────────────
 
     @GetMapping(value = "/studies/{studyUid}")
-    public ResponseEntity<StreamingResponseBody> retrieveStudy(@PathVariable String studyUid) {
-        List<InstanceLocation> instances = findInstancesByStudy(studyUid);
+    public ResponseEntity<StreamingResponseBody> retrieveStudy(
+            @PathVariable String tenant,
+            @PathVariable String studyUid) {
+        // Study-level retrieve: query tất cả series → batch load instance locations
+        // TODO: optimize bằng study-level cache nếu cần
+        List<WadoRsCacheService.InstanceLocation> instances =
+            wadoRsCacheService.findAllInStudy(cacheManager, tenant, studyUid);
         if (instances.isEmpty()) return ResponseEntity.notFound().build();
         return buildMultipartResponse(instances);
     }
 
     @GetMapping(value = "/studies/{studyUid}/series/{seriesUid}")
-    public ResponseEntity<StreamingResponseBody> retrieveSeries(@PathVariable String seriesUid) {
-        List<InstanceLocation> instances = findInstancesBySeries(seriesUid);
+    public ResponseEntity<StreamingResponseBody> retrieveSeries(
+            @PathVariable String tenant,
+            @PathVariable String seriesUid) {
+        List<WadoRsCacheService.InstanceLocation> instances =
+            wadoRsCacheService.findAllInSeries(cacheManager, tenant, seriesUid);
         if (instances.isEmpty()) return ResponseEntity.notFound().build();
         return buildMultipartResponse(instances);
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────
 
-    private ResponseEntity<StreamingResponseBody> buildMultipartResponse(List<InstanceLocation> instances) {
+    private ResponseEntity<StreamingResponseBody> buildMultipartResponse(
+            List<WadoRsCacheService.InstanceLocation> instances) {
         String boundary = "DICOMweb_" + UUID.randomUUID().toString().replace("-", "");
         StreamingResponseBody body = outputStream -> {
             PrintWriter writer = new PrintWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8));
-            for (InstanceLocation loc : instances) {
+            for (WadoRsCacheService.InstanceLocation loc : instances) {
                 writer.print("\r\n--" + boundary + "\r\n");
                 writer.print("Content-Type: application/dicom\r\n\r\n");
                 writer.flush();
@@ -366,34 +416,16 @@ public class WadoController {
             ))
             .body(body);
     }
-
-    private InstanceLocation findInstance(String sopUid) {
-        List<InstanceLocation> r = jdbcTemplate.query(
-            "SELECT volume_id, storage_path FROM instance WHERE sop_instance_uid = ? LIMIT 1",
-            (rs, i) -> new InstanceLocation(rs.getInt("volume_id"), rs.getString("storage_path")),
-            sopUid
-        );
-        return r.isEmpty() ? null : r.get(0);
-    }
-
-    private List<InstanceLocation> findInstancesByStudy(String studyUid) {
-        return jdbcTemplate.query(
-            "SELECT volume_id, storage_path FROM instance WHERE study_instance_uid = ? ORDER BY instance_number",
-            (rs, i) -> new InstanceLocation(rs.getInt("volume_id"), rs.getString("storage_path")),
-            studyUid
-        );
-    }
-
-    private List<InstanceLocation> findInstancesBySeries(String seriesUid) {
-        return jdbcTemplate.query(
-            "SELECT volume_id, storage_path FROM instance WHERE series_instance_uid = ? ORDER BY instance_number",
-            (rs, i) -> new InstanceLocation(rs.getInt("volume_id"), rs.getString("storage_path")),
-            seriesUid
-        );
-    }
-
-    record InstanceLocation(int volumeId, String storagePath) {}
 }
+```
+
+**Thay đổi so với bản cũ:**
+- Bỏ `JdbcTemplate` inject trực tiếp — mọi DB query đi qua `WadoRsCacheService`
+- Bỏ private helper methods `findInstance()`, `findInstancesByStudy()`, `findInstancesBySeries()` — thay bằng cached service calls
+- Bỏ inner record `InstanceLocation` — dùng `WadoRsCacheService.InstanceLocation`
+- `retrieveInstance()` và `retrieveFrames()` thêm `@PathVariable tenant, seriesUid` — cần cho cache key
+- `retrieveStudy()` và `retrieveSeries()` thêm `@PathVariable tenant` — cần cho cache key
+- URL validation: loose — `studyUid` không validate, `seriesUid` implicit validate qua cache lookup
 ```
 
 ## Lưu ý quan trọng
@@ -401,8 +433,9 @@ public class WadoController {
 - `SeriesMetadataBuilder.getOrBuild()` handle cả 2 cases: cache hit (fast) và fallback theo provider type
 - **Local fallback**: đọc trực tiếp + async rebuild. User sẽ thấy chậm lần đầu, nhanh từ lần 2.
 - **Cloud fallback**: sync build bắt buộc — không thể đọc N DICOM files từ cloud per request
-- Frame extraction hiện tại simplified (trả full file) — đủ cho OHIF single-frame images. Multi-frame cần implement proper extraction sau.
+- Frame extraction: proper implementation cho tất cả 4 loại ảnh (SPEC-22). Single-pass sequential qua requested frames.
 - `DicomMetadataBuilder` là interface → sau này có thể thêm `StudyMetadataBuilder` không cần sửa WadoController
+- **Caching** (SPEC-21): `WadoRsCacheService` batch-load instance locations theo series. 1000 frame requests cho 1 CT series → 1 DB query (2-step: series FK lookup + instance batch) thay vì 1000 queries scan 12+ partitions mỗi cái.
 
 ## Kiểm tra thành công
 - Sau ingest → `series.metadata_path` populated
@@ -410,3 +443,4 @@ public class WadoController {
 - Xóa `metadata_path` trong DB → request tiếp theo fallback đọc DICOM files → rebuild cache → request sau dùng cache
 - OHIF Viewer mở được 512-slice CT series mà không timeout
 - Cloud volume: metadata_path = null → first request builds synchronously → cached cho các request sau
+- **Cache test**: request frame 1 → cache miss (batch load) → request frame 2-1000 → cache hit (0 DB queries)
