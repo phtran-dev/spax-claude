@@ -36,14 +36,14 @@ public class BulkInsertRepository {
         // 2. Upsert studies (get/create study IDs)
         Map<String, Long> studyIds = upsertStudies(items, patientIds);
 
-        // 3. Upsert series (get/create series IDs)
-        Map<String, Long> seriesIds = upsertSeries(items, studyIds);
+        // 3. Upsert series (get/create series IDs + created_date for partition)
+        Map<String, SeriesRef> seriesRefs = upsertSeries(items, studyIds);
 
-        // 4. Dedup + insert instances
-        insertInstances(items, seriesIds);
+        // 4. Dedup + insert instances (dùng series created_date làm partition key)
+        insertInstances(items, seriesRefs);
 
         // 5. Update counters (num_instances, num_series, num_studies, sizes)
-        updateCounters(items, studyIds, seriesIds);
+        updateCounters(items, studyIds, seriesRefs);
     }
 
     // ─── PATIENT ─────────────────────────────────────────────────────────────
@@ -125,7 +125,14 @@ public class BulkInsertRepository {
 
     // ─── SERIES ───────────────────────────────────────────────────────────────
 
-    private Map<String, Long> upsertSeries(List<IndexedDicomMetadata> items, Map<String, Long> studyIds) {
+    /**
+     * Trả SeriesRef (id + createdDate) thay vì chỉ id.
+     * createdDate dùng làm partition key cho instance table:
+     * - New series: created_at = now() → createdDate = today
+     * - Existing series: created_at = ngày đầu tiên ingest series này
+     * → Mọi instances cùng series nằm cùng 1 partition → partition pruning hoạt động.
+     */
+    private Map<String, SeriesRef> upsertSeries(List<IndexedDicomMetadata> items, Map<String, Long> studyIds) {
         // Key for series dedup: (studyPublicId, seriesUid)
         Map<String, IndexedDicomMetadata> bySeries = new LinkedHashMap<>();
         for (IndexedDicomMetadata item : items) {
@@ -135,14 +142,15 @@ public class BulkInsertRepository {
             bySeries.putIfAbsent(seriesKey, item);
         }
 
-        Map<String, Long> result = new HashMap<>();
+        Map<String, SeriesRef> result = new HashMap<>();
 
         for (Map.Entry<String, IndexedDicomMetadata> entry : bySeries.entrySet()) {
             DicomMetadata d = entry.getValue().dicom();
             String studyPublicId = sha1(d.patientId() + "|" + d.studyInstanceUid());
             long studyFk = studyIds.get(studyPublicId);
 
-            Long id = jdbcTemplate.queryForObject("""
+            // RETURNING id, created_at — lấy cả created_at cho partition key
+            Map<String, Object> row = jdbcTemplate.queryForMap("""
                 INSERT INTO series
                   (series_instance_uid, modality, series_number, series_description,
                    body_part, institution, station_name, sending_aet, study_fk, study_instance_uid)
@@ -150,45 +158,51 @@ public class BulkInsertRepository {
                 ON CONFLICT (study_fk, series_instance_uid) DO UPDATE SET
                     modality = EXCLUDED.modality,
                     series_description = COALESCE(EXCLUDED.series_description, series.series_description)
-                RETURNING id
+                RETURNING id, created_at::date AS created_date
                 """,
-                Long.class,
                 d.seriesInstanceUid(), d.modality(), d.seriesNumber(), d.seriesDescription(),
                 d.bodyPart(), d.institution(), d.stationName(), d.sendingAet(),
                 studyFk, d.studyInstanceUid()
             );
 
-            result.put(entry.getKey(), id);
+            result.put(entry.getKey(), new SeriesRef(
+                ((Number) row.get("id")).longValue(),
+                ((java.sql.Date) row.get("created_date")).toLocalDate()
+            ));
         }
 
         return result;
     }
 
+    private record SeriesRef(long id, LocalDate createdDate) {}
+
     // ─── INSTANCE (application-level dedup) ───────────────────────────────────
 
-    private void insertInstances(List<IndexedDicomMetadata> items, Map<String, Long> seriesIds) {
+    private void insertInstances(List<IndexedDicomMetadata> items, Map<String, SeriesRef> seriesRefs) {
         // Application-level dedup: query existing SOPUIDs for each series
         // Cannot use DB-level UNIQUE because PostgreSQL partitioned table requires partition key in UNIQUE index
 
-        // Group items by series
-        Map<Long, List<IndexedDicomMetadata>> bySeriesFk = new LinkedHashMap<>();
+        // Group items by series key
+        Map<String, List<IndexedDicomMetadata>> bySeriesKey = new LinkedHashMap<>();
         for (IndexedDicomMetadata item : items) {
             DicomMetadata d = item.dicom();
             String studyPublicId = sha1(d.patientId() + "|" + d.studyInstanceUid());
             String seriesKey = studyPublicId + "|" + d.seriesInstanceUid();
-            long seriesFk = seriesIds.get(seriesKey);
-            bySeriesFk.computeIfAbsent(seriesFk, k -> new ArrayList<>()).add(item);
+            bySeriesKey.computeIfAbsent(seriesKey, k -> new ArrayList<>()).add(item);
         }
 
-        for (Map.Entry<Long, List<IndexedDicomMetadata>> entry : bySeriesFk.entrySet()) {
-            long seriesFk = entry.getKey();
+        for (Map.Entry<String, List<IndexedDicomMetadata>> entry : bySeriesKey.entrySet()) {
+            SeriesRef ref = seriesRefs.get(entry.getKey());
+            long seriesFk = ref.id();
+            java.sql.Date createdDate = java.sql.Date.valueOf(ref.createdDate());
             List<IndexedDicomMetadata> seriesItems = entry.getValue();
 
             // Query existing SOPUIDs for this series
+            // Dùng created_date để partition pruning — chỉ scan 1 partition
             List<String> existingSops = jdbcTemplate.queryForList(
-                "SELECT sop_instance_uid FROM instance WHERE series_fk = ?",
+                "SELECT sop_instance_uid FROM instance WHERE series_fk = ? AND created_date = ?",
                 String.class,
-                seriesFk
+                seriesFk, createdDate
             );
             Set<String> existingSet = new HashSet<>(existingSops);
 
@@ -199,13 +213,13 @@ public class BulkInsertRepository {
 
             if (toInsert.isEmpty()) continue;
 
-            // Batch insert
+            // Batch insert — created_date = series.created_at::date (không phải CURRENT_DATE)
             jdbcTemplate.batchUpdate("""
                 INSERT INTO instance
                   (sop_instance_uid, sop_class_uid, instance_number, transfer_syntax_uid,
                    num_frames, file_size, volume_id, storage_path,
                    series_fk, series_instance_uid, study_instance_uid, created_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 toInsert,
                 toInsert.size(),
@@ -222,6 +236,7 @@ public class BulkInsertRepository {
                     ps.setLong(9, seriesFk);
                     ps.setString(10, d.seriesInstanceUid());
                     ps.setString(11, d.studyInstanceUid());
+                    ps.setDate(12, createdDate);  // partition key = series created date
                 }
             );
         }
@@ -230,7 +245,7 @@ public class BulkInsertRepository {
     // ─── COUNTERS ─────────────────────────────────────────────────────────────
 
     private void updateCounters(List<IndexedDicomMetadata> items,
-                                 Map<String, Long> studyIds, Map<String, Long> seriesIds) {
+                                 Map<String, Long> studyIds, Map<String, SeriesRef> seriesRefs) {
         // Update series counts
         Set<Long> affectedSeriesFks = new HashSet<>();
         Set<Long> affectedStudyFks = new HashSet<>();
@@ -239,7 +254,7 @@ public class BulkInsertRepository {
             DicomMetadata d = item.dicom();
             String studyPublicId = sha1(d.patientId() + "|" + d.studyInstanceUid());
             String seriesKey = studyPublicId + "|" + d.seriesInstanceUid();
-            affectedSeriesFks.add(seriesIds.get(seriesKey));
+            affectedSeriesFks.add(seriesRefs.get(seriesKey).id());
             affectedStudyFks.add(studyIds.get(studyPublicId));
         }
 
@@ -311,7 +326,7 @@ public class BulkInsertRepository {
             byte[] hash = md.digest(input.getBytes(StandardCharsets.UTF_8));
             StringBuilder sb = new StringBuilder();
             for (byte b : hash) sb.append(String.format("%02x", b));
-            return sb.toString();  // 40 hex chars = CHAR(40)
+            return sb.toString();  // 40 hex chars (SHA-1) — column is VARCHAR(128) for future algorithm change
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);  // SHA-1 always available
         }
@@ -346,7 +361,15 @@ public interface PatientRepository extends JpaRepository<Patient, Long> {
 public interface StudyRepository extends JpaRepository<Study, Long> {
     Optional<Study> findByPublicId(String publicId);
     List<Study> findByPatientFk(Long patientFk);
-    Optional<Study> findByStudyInstanceUid(String uid);
+
+    /**
+     * QUAN TRỌNG: trả List, không phải Optional.
+     * study_instance_uid KHÔNG phải unique key trong SPAX.
+     * Unique key là public_id = SHA1(patientId + "|" + studyUid).
+     * Hai patient khác nhau có thể có cùng StudyInstanceUID
+     * (máy clone, firmware lỗi, merge dataset).
+     */
+    List<Study> findByStudyInstanceUid(String uid);
 }
 ```
 
@@ -356,6 +379,13 @@ public interface StudyRepository extends JpaRepository<Study, Long> {
 public interface SeriesRepository extends JpaRepository<Series, Long> {
     List<Series> findByStudyFk(Long studyFk);
     Optional<Series> findByStudyFkAndSeriesInstanceUid(Long studyFk, String seriesUid);
+
+    /**
+     * Trả List — series_instance_uid không unique toàn cục,
+     * chỉ unique trong 1 study (UNIQUE(study_fk, series_instance_uid)).
+     * Nhiều studies khác nhau có thể chứa series cùng UID.
+     */
+    List<Series> findBySeriesInstanceUid(String uid);
 }
 ```
 
@@ -365,14 +395,24 @@ public interface SeriesRepository extends JpaRepository<Series, Long> {
 public interface InstanceRepository extends JpaRepository<Instance, Long> {
     List<Instance> findByStudyInstanceUid(String studyUid);
     List<Instance> findBySeriesFk(Long seriesFk);
-    Optional<Instance> findBySopInstanceUid(String sopUid);
+
+    /**
+     * Trả List — sop_instance_uid không có DB-level UNIQUE constraint
+     * (PostgreSQL partitioned table yêu cầu partition key trong unique index,
+     * mà created_date + sop_uid không có ý nghĩa).
+     * Dedup ở application level (BulkInsertRepository).
+     * Trong thực tế thường chỉ có 1 row, nhưng không guarantee.
+     */
+    List<Instance> findBySopInstanceUid(String sopUid);
 }
 ```
 
 ## Lưu ý quan trọng
+- **UID không unique**: `study_instance_uid`, `series_instance_uid`, `sop_instance_uid` **không phải unique key** trong SPAX. Repository methods `findByXxxUid()` phải trả `List<T>`, không phải `Optional<T>`. Lý do: máy clone/firmware lỗi tạo UID trùng giữa patients. Unique key thực sự: `patient.public_id`, `study.public_id = SHA1(pid|studyUid)`, `series: UNIQUE(study_fk, series_uid)`, instance: app-level dedup.
 - SHA-1 formula: `patient.public_id = SHA1(patientId)`, `study.public_id = SHA1(patientId + "|" + studyUid)`
 - `"|"` là separator (pipe) — theo Orthanc convention
-- Application-level dedup cho instance: query `idx_instance_dedup` index trước khi INSERT
+- **`instance.created_date` = `series.created_at::date`** (không dùng `CURRENT_DATE`). Mọi instances cùng series nằm cùng 1 partition → DICOMWeb query có thể partition prune bằng cách lấy `created_date` từ series table trước. Late arrival (re-send sau N tháng) vào partition cũ — chấp nhận được vì lifecycle quản lý theo study/series, không theo instance riêng lẻ.
+- Application-level dedup cho instance: query `idx_instance_dedup` index trước khi INSERT, kèm `created_date` để partition prune
 - `batchUpsert()` là `@Transactional` — rollback toàn bộ batch nếu có lỗi DB
 - `triggerMetadataRebuild()` gọi **sau** `batchUpsert()` (ngoài transaction), async — không ảnh hưởng ingest throughput
 - Counter update dùng `SELECT COUNT(*) / SUM()` subquery để recalculate chính xác thay vì increment

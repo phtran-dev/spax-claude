@@ -68,13 +68,20 @@ public class SeriesMetadataBuilder implements DicomMetadataBuilder {
      */
     @Override
     public String buildAndSave(String seriesUid, String tenantCode) throws IOException {
-        // 1. Query tất cả instances (volume_id + storage_path, theo thứ tự instance_number)
+        // 1. Query tất cả instances (2-step: series → created_date → instances with partition pruning)
+        Map<String, Object> seriesRow = jdbcTemplate.queryForMap(
+            "SELECT id, created_at::date AS created_date FROM series WHERE series_instance_uid = ?",
+            seriesUid
+        );
+        long seriesFk = ((Number) seriesRow.get("id")).longValue();
+        java.sql.Date createdDate = (java.sql.Date) seriesRow.get("created_date");
+
         List<Map<String, Object>> instances = jdbcTemplate.queryForList("""
             SELECT volume_id, storage_path
             FROM instance
-            WHERE series_instance_uid = ?
+            WHERE series_fk = ? AND created_date = ?
             ORDER BY instance_number
-            """, seriesUid
+            """, seriesFk, createdDate
         );
 
         if (instances.isEmpty()) return null;
@@ -131,14 +138,29 @@ public class SeriesMetadataBuilder implements DicomMetadataBuilder {
      */
     @Override
     public InputStream getOrBuild(String seriesUid, String tenantCode) throws IOException {
+        // Query series info + provider_type (không query instance table trực tiếp
+        // vì partitioned table scan tất cả partitions khi thiếu created_date).
+        // Dùng WadoRsCacheService hoặc lấy volume từ series-level info nếu có.
+        // Fallback: query instance kèm created_date cho partition pruning.
         Map<String, Object> series = jdbcTemplate.queryForMap("""
-            SELECT metadata_volume_id, metadata_path,
-                   (SELECT provider_type FROM public.storage_volume
-                    WHERE id = (SELECT volume_id FROM instance
-                                WHERE series_instance_uid = ? LIMIT 1)) AS provider_type
-            FROM series WHERE series_instance_uid = ?
-            """, seriesUid, seriesUid
+            SELECT s.metadata_volume_id, s.metadata_path, s.id AS series_id,
+                   s.created_at::date AS created_date
+            FROM series s WHERE s.series_instance_uid = ?
+            """, seriesUid
         );
+
+        // Lấy provider_type từ 1 instance (dùng partition pruning)
+        String providerType = null;
+        if (series.get("metadata_path") == null) {
+            long seriesFk = ((Number) series.get("series_id")).longValue();
+            java.sql.Date createdDate = (java.sql.Date) series.get("created_date");
+            providerType = jdbcTemplate.queryForObject("""
+                SELECT sv.provider_type FROM public.storage_volume sv
+                WHERE sv.id = (SELECT i.volume_id FROM instance i
+                               WHERE i.series_fk = ? AND i.created_date = ? LIMIT 1)
+                """, String.class, seriesFk, createdDate
+            );
+        }
 
         String metadataPath = (String) series.get("metadata_path");
 
@@ -149,7 +171,6 @@ public class SeriesMetadataBuilder implements DicomMetadataBuilder {
         }
 
         // ── Fallback: chưa có cache ───────────────────────────────────────
-        String providerType = (String) series.get("provider_type");
         boolean isCloud = providerType != null && !"LOCAL".equals(providerType);
 
         if (isCloud) {
@@ -182,10 +203,19 @@ public class SeriesMetadataBuilder implements DicomMetadataBuilder {
     // ─── build trực tiếp từ DICOM files (không cache) ─────────────────────
 
     private InputStream buildFromDicomFiles(String seriesUid) throws IOException {
+        // 2-step query: series → created_date → instances with partition pruning
+        Map<String, Object> seriesRow = jdbcTemplate.queryForMap(
+            "SELECT id, created_at::date AS created_date FROM series WHERE series_instance_uid = ?",
+            seriesUid
+        );
+        long seriesFk = ((Number) seriesRow.get("id")).longValue();
+        java.sql.Date createdDate = (java.sql.Date) seriesRow.get("created_date");
+
         List<Map<String, Object>> instances = jdbcTemplate.queryForList("""
             SELECT volume_id, storage_path FROM instance
-            WHERE series_instance_uid = ? ORDER BY instance_number
-            """, seriesUid
+            WHERE series_fk = ? AND created_date = ?
+            ORDER BY instance_number
+            """, seriesFk, createdDate
         );
 
         List<Map<String, Object>> dicomJsonArray = new ArrayList<>();
@@ -311,7 +341,8 @@ public class WadoController {
      * - Uncompressed: Content-Type: application/octet-stream
      * - Compressed: Content-Type: application/octet-stream; transfer-syntax={tsuid}
      *
-     * Single-pass: 1 file open, 1 header parse cho tất cả frames (SPEC-22).
+     * Proper frame extraction cho 4 loại ảnh DICOM (SPEC-22):
+     * UncompressedSingle, CompressedSingle, UncompressedMulti, CompressedMulti.
      * Cache: batch load toàn bộ series → 1000 frame requests chỉ 1 DB query.
      */
     @GetMapping(value = "/studies/{studyUid}/series/{seriesUid}/instances/{sopUid}/frames/{frameList}")

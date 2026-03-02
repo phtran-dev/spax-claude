@@ -16,21 +16,19 @@ Implement proper WADO-RS frame extraction cho endpoint `GET /dicomweb/{tenant}/.
 
 ## Thiết kế
 
-### Single-pass sequential
-Mở 1 InputStream duy nhất, đọc DICOM header 1 lần, rồi navigate qua tất cả requested frames theo thứ tự ascending. Tối ưu cho cả local (1 disk read) và cloud storage (1 GET request).
+### Per-frame InputStream (V1)
+Mỗi frame mở 1 InputStream riêng: open → parse header → skip tới frame → đọc → close. Đơn giản, stateless, dễ debug. Local storage: nhanh nhờ OS page cache. Cloud: N GET requests cho N frames — chấp nhận được vì OHIF thường gọi 1 frame/HTTP request.
 
 ```
 Request: GET /frames/1,3,5
 
-openStream()
-  parse DICOM header (1 lần)
-  → frame 1: read frame bytes → write MIME part 1
-  → skip frame 2
-  → frame 3: read frame bytes → write MIME part 2
-  → skip frame 4
-  → frame 5: read frame bytes → write MIME part 3
-close
+Frame 1: openStream() → skip header → read frame 1 → close
+Frame 3: openStream() → skip header → skip 2 frames → read frame 3 → close
+Frame 5: openStream() → skip header → skip 4 frames → read frame 5 → close
 ```
+
+### Upgrade path → Single-pass (V2, sau)
+Khi cần tối ưu cloud storage: chuyển sang single-pass (1 InputStream cho tất cả frames). Chỉ thay đổi nội bộ `FrameExtractor` + `FrameRetrievalService` — không ảnh hưởng `WadoController`, `FrameType`, `MultipartFrameWriter`.
 
 ### Không transcoding
 Server trả pixel data ở native transfer syntax. OHIF's cornerstonejs tự decompress client-side (JPEG, JPEG-LS, JPEG2000, RLE đều có codec). Đơn giản, đúng SPAX principle.
@@ -112,7 +110,7 @@ public enum FrameType {
 
 ### 2. `src/main/java/com/spax/dicomweb/frame/FrameExtractor.java`
 
-Core frame extraction logic. Single-pass: đọc header 1 lần, navigate qua tất cả requested frames.
+Core frame extraction logic. Per-frame: mỗi lần gọi extract 1 frame từ 1 fresh InputStream.
 
 ```java
 package com.spax.dicomweb.frame;
@@ -128,22 +126,23 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.List;
 
 /**
- * Extracts pixel data frames from a DICOM file stream.
+ * Extracts a single pixel data frame from a DICOM file stream.
  *
- * Design: single-pass sequential.
- * - Opens DicomInputStream, reads DICOM header once
- * - Navigates through pixel data to extract requested frames in ascending order
- * - Each frame is written to output via callback
+ * Design: per-frame — each call receives a fresh InputStream positioned at file start.
+ * Stateless, simple, easy to debug.
  *
  * Works with any InputStream (local file, cloud storage GET response).
- * Does NOT buffer entire file in RAM — reads header (~few KB), then streams pixel data.
+ * Does NOT buffer entire file in RAM — reads header (~few KB), skips to frame, streams pixel data.
  *
  * Reference implementations:
  * - store-server-2x: UncompressedMultiFrameInputStream, CompressedMultiFrameInputStream
  * - dcm4chee-arc-light: UncompressedFramesOutput, CompressedFramesOutput
+ *
+ * Upgrade path: khi cần tối ưu cloud (1 GET thay vì N), chuyển sang single-pass
+ * với extractFrames(stream, List<frameNumbers>, callback). Chỉ thay đổi nội bộ,
+ * không ảnh hưởng caller.
  */
 @Component
 public class FrameExtractor {
@@ -152,43 +151,27 @@ public class FrameExtractor {
     private static final int BUFFER_SIZE = 8192;
 
     /**
-     * Callback interface: called before each frame's pixel data is written.
-     * Returns the OutputStream to write frame bytes to.
-     */
-    @FunctionalInterface
-    public interface FrameCallback {
-        /**
-         * Called when a frame is about to be written.
-         * Implementation should write MIME part headers, then return the OutputStream
-         * for the frame's pixel bytes.
-         *
-         * @param frameNumber 1-based frame number
-         * @return OutputStream to write pixel data to
-         */
-        OutputStream onFrameStart(int frameNumber) throws IOException;
-    }
-
-    /**
-     * Extract frames from a DICOM stream in a single pass.
+     * Extract 1 frame from a DICOM stream, write pixel bytes to output.
      *
-     * @param dicomStream  DICOM file InputStream. Caller owns lifecycle (closes after return).
-     * @param frameNumbers 1-based frame numbers, MUST be sorted ascending, MUST be non-empty.
+     * @param dicomStream  fresh DICOM file InputStream (positioned at file start).
+     *                     Caller owns lifecycle (closes after return).
+     * @param frameNumber  1-based frame number (per DICOMWeb spec)
      * @param frameType    pre-classified image type (from FrameType.classify)
-     * @param callback     called per frame to get OutputStream for writing
-     * @throws IOException            if stream read/write fails
-     * @throws IllegalArgumentException if frame index out of range
+     * @param output       target OutputStream for pixel bytes
+     * @throws IOException              if stream read/write fails or pixel data missing
+     * @throws IllegalArgumentException if frameNumber out of range
      */
-    public void extractFrames(InputStream dicomStream, List<Integer> frameNumbers,
-                              FrameType frameType, FrameCallback callback) throws IOException {
+    public void extractFrame(InputStream dicomStream, int frameNumber,
+                             FrameType frameType, OutputStream output) throws IOException {
         switch (frameType) {
             case UNCOMPRESSED_SINGLE ->
-                extractUncompressedSingle(dicomStream, callback, frameNumbers.getFirst());
+                extractUncompressedSingle(dicomStream, output);
             case COMPRESSED_SINGLE, VIDEO ->
-                extractCompressedSingle(dicomStream, callback, frameNumbers.getFirst());
+                extractCompressedSingle(dicomStream, output);
             case UNCOMPRESSED_MULTI ->
-                extractUncompressedMulti(dicomStream, frameNumbers, callback);
+                extractUncompressedMulti(dicomStream, frameNumber, output);
             case COMPRESSED_MULTI ->
-                extractCompressedMulti(dicomStream, frameNumbers, callback);
+                extractCompressedMulti(dicomStream, frameNumber, output);
         }
     }
 
@@ -196,10 +179,10 @@ public class FrameExtractor {
 
     /**
      * Uncompressed single frame: pixel data is a contiguous byte block after the header.
-     * Read header → stream all remaining pixel bytes.
+     * Read header → stream all pixel bytes.
      */
-    private void extractUncompressedSingle(InputStream rawStream, FrameCallback callback,
-                                            int frameNumber) throws IOException {
+    private void extractUncompressedSingle(InputStream rawStream,
+                                            OutputStream output) throws IOException {
         try (DicomInputStream dis = new DicomInputStream(rawStream)) {
             dis.readDataset(-1, Tag.PixelData);
 
@@ -207,11 +190,9 @@ public class FrameExtractor {
                 throw new IOException("No pixel data found in DICOM file");
             }
 
-            // Pixel data length is known for uncompressed (dis.length() > 0)
             int pixelDataLength = dis.length();
             log.debug("Uncompressed single frame: {} bytes pixel data", pixelDataLength);
 
-            OutputStream output = callback.onFrameStart(frameNumber);
             copyExactly(dis, output, pixelDataLength);
         }
     }
@@ -229,9 +210,10 @@ public class FrameExtractor {
      *     Sequence Delimiter (FFFE,E00D)
      *
      * Strategy: skip BOT, concatenate all remaining fragments until delimiter.
+     * Also used for VIDEO transfer syntaxes (entire pixel blob).
      */
-    private void extractCompressedSingle(InputStream rawStream, FrameCallback callback,
-                                          int frameNumber) throws IOException {
+    private void extractCompressedSingle(InputStream rawStream,
+                                          OutputStream output) throws IOException {
         try (DicomInputStream dis = new DicomInputStream(rawStream)) {
             dis.readDataset(-1, Tag.PixelData);
 
@@ -240,10 +222,8 @@ public class FrameExtractor {
             }
 
             // Skip Basic Offset Table (first item)
-            dis.readHeader();     // reads item tag + length
-            dis.skipFully(dis.length()); // skip BOT body
-
-            OutputStream output = callback.onFrameStart(frameNumber);
+            dis.readHeader();
+            dis.skipFully(dis.length());
 
             // Read all remaining fragments until Sequence Delimiter
             byte[] buf = new byte[BUFFER_SIZE];
@@ -251,7 +231,6 @@ public class FrameExtractor {
                 if (dis.tag() == Tag.SequenceDelimitationItem) {
                     break;
                 }
-                // Item tag = (FFFE,E000): copy fragment body to output
                 int itemLength = dis.length();
                 copyExactly(dis, output, itemLength, buf);
             }
@@ -260,20 +239,20 @@ public class FrameExtractor {
         }
     }
 
-    // ─── Uncompressed Multi Frame — single pass ───────────────────────
+    // ─── Uncompressed Multi Frame ─────────────────────────────────────
 
     /**
      * Uncompressed multi-frame: pixel data is a contiguous block.
      * Frame N occupies bytes [(N-1)*frameLength .. N*frameLength).
-     * frameLength = rows * columns * (bitsAllocated/8) * samplesPerPixel.
+     * frameLength = rows × columns × (bitsAllocated/8) × samplesPerPixel.
      *
-     * Single-pass: navigate forward through the pixel data, extracting
-     * requested frames and skipping unwanted ones.
+     * Skip to the requested frame, read exactly frameLength bytes.
+     *
+     * Ref: store-server-2x UncompressedMultiFrameInputStream
      */
-    private void extractUncompressedMulti(InputStream rawStream, List<Integer> frameNumbers,
-                                           FrameCallback callback) throws IOException {
+    private void extractUncompressedMulti(InputStream rawStream, int frameNumber,
+                                           OutputStream output) throws IOException {
         try (DicomInputStream dis = new DicomInputStream(rawStream)) {
-            // Read all attributes up to pixel data to compute frame length
             Attributes attrs = dis.readDataset(-1, Tag.PixelData);
 
             if (dis.tag() != Tag.PixelData && dis.tag() != Tag.FloatPixelData
@@ -285,32 +264,24 @@ public class FrameExtractor {
             int frameLength = new ImageDescriptor(attrs).getFrameLength();
             log.debug("Uncompressed multi-frame: {} frames, {} bytes/frame", totalFrames, frameLength);
 
-            byte[] buf = new byte[BUFFER_SIZE];
-            int currentFrame = 1;  // 1-based, tracks current position in pixel data
-
-            for (int requestedFrame : frameNumbers) {
-                if (requestedFrame < 1 || requestedFrame > totalFrames) {
-                    throw new IllegalArgumentException(
-                        "Frame " + requestedFrame + " out of range [1.." + totalFrames + "]");
-                }
-
-                // Skip frames between current position and requested frame
-                int framesToSkip = requestedFrame - currentFrame;
-                if (framesToSkip > 0) {
-                    long bytesToSkip = (long) framesToSkip * frameLength;
-                    skipExactly(dis, bytesToSkip);
-                }
-
-                // Extract the requested frame
-                OutputStream output = callback.onFrameStart(requestedFrame);
-                copyExactly(dis, output, frameLength, buf);
-
-                currentFrame = requestedFrame + 1;
+            if (frameNumber < 1 || frameNumber > totalFrames) {
+                throw new IllegalArgumentException(
+                    "Frame " + frameNumber + " out of range [1.." + totalFrames + "]");
             }
+
+            // Skip to requested frame
+            long bytesToSkip = (long) (frameNumber - 1) * frameLength;
+            if (bytesToSkip > 0) {
+                skipExactly(dis, bytesToSkip);
+            }
+
+            // Read exactly 1 frame
+            byte[] buf = new byte[BUFFER_SIZE];
+            copyExactly(dis, output, frameLength, buf);
         }
     }
 
-    // ─── Compressed Multi Frame — single pass ─────────────────────────
+    // ─── Compressed Multi Frame ───────────────────────────────────────
 
     /**
      * Compressed multi-frame: encapsulated format with 1 item (fragment) per frame.
@@ -323,16 +294,16 @@ public class FrameExtractor {
      *     ...
      *     Sequence Delimiter
      *
-     * Single-pass: iterate through item headers, skip unwanted frames,
-     * read requested frames.
+     * Iterate through item headers, skip (frameNumber-1) items, read the target item.
      *
      * Note: per DICOM PS3.5 A.4, frames MAY span multiple fragments.
      * This implementation assumes 1 fragment = 1 frame, which covers
-     * the vast majority of real-world DICOM data. Multi-fragment frames
-     * are rare and typically only seen in very old encoders.
+     * the vast majority of real-world DICOM data.
+     *
+     * Ref: store-server-2x CompressedMultiFrameInputStream
      */
-    private void extractCompressedMulti(InputStream rawStream, List<Integer> frameNumbers,
-                                         FrameCallback callback) throws IOException {
+    private void extractCompressedMulti(InputStream rawStream, int frameNumber,
+                                         OutputStream output) throws IOException {
         try (DicomInputStream dis = new DicomInputStream(rawStream)) {
             dis.readDataset(-1, Tag.PixelData);
 
@@ -344,32 +315,26 @@ public class FrameExtractor {
             dis.readHeader();
             dis.skipFully(dis.length());
 
-            byte[] buf = new byte[BUFFER_SIZE];
-            int currentFrame = 1;
-
-            for (int requestedFrame : frameNumbers) {
-                // Skip frames before the requested one
-                while (currentFrame < requestedFrame) {
-                    if (!dis.readHeader() || dis.tag() == Tag.SequenceDelimitationItem) {
-                        throw new IllegalArgumentException(
-                            "Frame " + requestedFrame + " exceeds available frames (hit end at frame " + currentFrame + ")");
-                    }
-                    dis.skipFully(dis.length());
-                    currentFrame++;
-                }
-
-                // Read the requested frame's item
+            // Skip items until we reach the requested frame
+            for (int i = 1; i < frameNumber; i++) {
                 if (!dis.readHeader() || dis.tag() == Tag.SequenceDelimitationItem) {
                     throw new IllegalArgumentException(
-                        "Frame " + requestedFrame + " exceeds available frames");
+                        "Frame " + frameNumber + " exceeds available frames (hit end at frame " + i + ")");
                 }
-
-                int itemLength = dis.length();
-                OutputStream output = callback.onFrameStart(requestedFrame);
-                copyExactly(dis, output, itemLength, buf);
-
-                currentFrame++;
+                dis.skipFully(dis.length());
             }
+
+            // Read the requested frame's item
+            if (!dis.readHeader() || dis.tag() == Tag.SequenceDelimitationItem) {
+                throw new IllegalArgumentException(
+                    "Frame " + frameNumber + " exceeds available frames");
+            }
+
+            int itemLength = dis.length();
+            byte[] buf = new byte[BUFFER_SIZE];
+            copyExactly(dis, output, itemLength, buf);
+
+            log.debug("Compressed multi-frame: extracted frame {} ({} bytes)", frameNumber, itemLength);
         }
     }
 
@@ -495,7 +460,7 @@ public class MultipartFrameWriter {
 
 ### 4. `src/main/java/com/spax/dicomweb/frame/FrameRetrievalService.java`
 
-Orchestrator: kết nối cache → storage → extraction → multipart output.
+Orchestrator: kết nối cache → storage → extraction → multipart output. Loop per frame.
 
 ```java
 package com.spax.dicomweb.frame;
@@ -515,18 +480,18 @@ import java.util.List;
 /**
  * Orchestrates WADO-RS frame retrieval.
  *
- * Flow (single-pass):
+ * Flow (per-frame):
  * 1. Validate frame numbers against cached numFrames
  * 2. Classify image type from cached transferSyntaxUid + numFrames
- * 3. Open DICOM file stream from storage (1 time)
- * 4. Extract all requested frames sequentially via FrameExtractor
- * 5. Write multipart response via MultipartFrameWriter
- * 6. Close stream
+ * 3. For each frame:
+ *    a. Write MIME part header
+ *    b. Open DICOM file stream from storage
+ *    c. Extract frame via FrameExtractor
+ *    d. Close stream
+ * 4. Write multipart end boundary
  *
- * Caller (WadoController) is responsible for:
- * - Parsing and sorting frameList
- * - Cache lookup (findInstance)
- * - Setting response Content-Type header
+ * Upgrade path: khi cần tối ưu → open 1 stream, extract tất cả frames single-pass.
+ * Chỉ cần thay đổi class này + FrameExtractor. Caller (WadoController) không đổi.
  */
 @Service
 public class FrameRetrievalService {
@@ -571,24 +536,17 @@ public class FrameRetrievalService {
             output, boundary, loc.transferSyntaxUid(), frameType.isCompressed()
         );
 
-        // 4. Open DICOM stream (single open for all frames)
-        try (InputStream dicomStream = storageService.retrieve(loc.volumeId(), loc.storagePath())) {
+        // 4. Extract each frame (per-frame InputStream open)
+        for (int frameNumber : frameNumbers) {
+            writer.writePartHeader(frameNumber);
 
-            // 5. Extract frames — single pass through the stream
-            frameExtractor.extractFrames(dicomStream, frameNumbers, frameType,
-                frameNumber -> {
-                    writer.writePartHeader(frameNumber);
-                    return writer.getOutputStream();
-                }
-            );
-
-        } catch (IllegalArgumentException e) {
-            // Frame range errors from extractor (e.g., file has fewer frames than DB says)
-            log.warn("Frame extraction failed for {}: {}", loc.storagePath(), e.getMessage());
-            throw e;
+            try (InputStream dicomStream = storageService.retrieve(
+                    loc.volumeId(), loc.storagePath())) {
+                frameExtractor.extractFrame(dicomStream, frameNumber, frameType, output);
+            }
         }
 
-        // 6. Close multipart
+        // 5. Close multipart
         writer.writeEnd();
 
         log.debug("Wrote {} frames for {} (type={})",
@@ -671,7 +629,6 @@ private FrameRetrievalService frameRetrievalService;
  * - Uncompressed: Content-Type: application/octet-stream
  * - Compressed: Content-Type: application/octet-stream; transfer-syntax={tsuid}
  *
- * Single-pass: 1 file open, 1 header parse cho tất cả frames.
  * Cache: batch load toàn bộ series → 1000 frame requests chỉ 1 DB query.
  */
 @GetMapping(value = "/studies/{studyUid}/series/{seriesUid}/instances/{sopUid}/frames/{frameList}")
@@ -778,6 +735,15 @@ Content-Type: application/octet-stream
 // hoặc cho compressed:
 Content-Type: application/octet-stream; transfer-syntax={tsuid}
 ```
+
+### Upgrade V1 → V2 (single-pass)
+
+Khi cần tối ưu (cloud storage N GET → 1 GET), chỉ thay đổi 2 files:
+
+1. **`FrameExtractor`**: thêm method `extractFrames(stream, List<frameNumbers>, callback)` — giữ stream open, navigate qua tất cả frames ascending
+2. **`FrameRetrievalService`**: thay loop `for (frame: open → extract → close)` bằng single open + delegate to `extractFrames`
+
+Không thay đổi: `FrameType`, `MultipartFrameWriter`, `WadoController`, `WadoRsCacheService`.
 
 ## Kiểm tra thành công
 

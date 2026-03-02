@@ -89,7 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_migration_tenant ON migration_task (tenant_code, 
 -- Patient table
 CREATE TABLE patient (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    public_id       CHAR(40) NOT NULL,
+    public_id       VARCHAR(128) NOT NULL,
     patient_id      VARCHAR(64) NOT NULL,
     patient_name    VARCHAR(324),
     patient_name_search TSVECTOR GENERATED ALWAYS AS (
@@ -111,7 +111,7 @@ CREATE INDEX idx_patient_provisional ON patient (is_provisional) WHERE is_provis
 -- Study table
 CREATE TABLE study (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    public_id           CHAR(40) NOT NULL,
+    public_id           VARCHAR(128) NOT NULL,
     study_instance_uid  VARCHAR(64) NOT NULL,
     study_date          VARCHAR(16),
     study_time          VARCHAR(14),
@@ -164,6 +164,10 @@ CREATE INDEX idx_series_modality ON series (modality);
 CREATE INDEX idx_series_station ON series (station_name) WHERE station_name IS NOT NULL;
 
 -- Instance table (partitioned by created_date)
+-- created_date lấy từ series.created_at::date (KHÔNG dùng CURRENT_DATE).
+-- Mọi instances cùng series nằm trong CÙNG 1 partition → enable partition pruning
+-- khi query bằng series_fk + created_date.
+-- DICOMWeb chuẩn không có created_date → lấy từ series table (2-step query).
 CREATE TABLE instance (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY,
     sop_instance_uid    VARCHAR(64) NOT NULL,
@@ -177,7 +181,7 @@ CREATE TABLE instance (
     series_fk           BIGINT NOT NULL,
     series_instance_uid VARCHAR(64) NOT NULL,
     study_instance_uid  VARCHAR(64) NOT NULL,
-    created_date        DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_date        DATE NOT NULL,  -- = series.created_at::date, set by application
     CONSTRAINT pk_instance PRIMARY KEY (id, created_date)
 ) PARTITION BY RANGE (created_date);
 
@@ -240,6 +244,7 @@ CREATE INDEX idx_compression_task_status ON compression_task (status) WHERE stat
 - Flyway chỉ chạy files trong `src/main/resources/db/migration/`
 - Không tạo default partition cho `instance` table ở đây — `AutoPartitionService` (SPEC-17) sẽ tạo theo schedule
 - Không có FK từ tenant schema sang public schema (cross-schema FK không reliable trong multi-tenant setup)
+- **`instance.created_date`** = `series.created_at::date` — set bởi application khi INSERT (xem SPEC-09), KHÔNG dùng `DEFAULT CURRENT_DATE`. Mọi instances cùng series nằm cùng 1 partition → partition pruning hoạt động. DICOMWeb chuẩn không có `created_date` → lấy từ series table qua 2-step query: `series.id + created_at::date` → `instance WHERE series_fk = ? AND created_date = ?`
 
 ## Kiểm tra thành công
 - Application boot thành công (Flyway chạy `V1__shared_schema.sql`)

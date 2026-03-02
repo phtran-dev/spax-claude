@@ -221,22 +221,31 @@ public class WadoRsCacheService {
     }
 
     /**
-     * 2-step batch load:
-     * 1. series_instance_uid → series.id (idx_series_uid)
-     * 2. series.id → all instances (idx_instance_dedup)
+     * 2-step batch load (with partition pruning):
+     * 1. series_instance_uid → series.id + created_at::date (idx_series_uid)
+     * 2. series.id + created_date → all instances (idx_instance_dedup, single partition)
+     *
+     * Tất cả instances cùng series có cùng created_date = series.created_at::date,
+     * nên truyền created_date vào WHERE clause → PostgreSQL prune xuống đúng 1 partition
+     * thay vì scan 60+ partitions.
      */
     private SeriesInstanceLocations loadSeriesLocations(String seriesUid) {
-        List<Long> seriesIds = jdbcTemplate.queryForList(
-            "SELECT id FROM series WHERE series_instance_uid = ?",
-            Long.class, seriesUid
+        // Step 1: lấy series.id + created_at::date
+        List<Map<String, Object>> seriesRows = jdbcTemplate.queryForList(
+            "SELECT id, created_at::date AS created_date FROM series WHERE series_instance_uid = ?",
+            seriesUid
         );
-        if (seriesIds.isEmpty()) return null;
+        if (seriesRows.isEmpty()) return null;
 
+        long seriesFk = ((Number) seriesRows.getFirst().get("id")).longValue();
+        java.sql.Date createdDate = (java.sql.Date) seriesRows.getFirst().get("created_date");
+
+        // Step 2: query instances với partition pruning
         List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
             SELECT sop_instance_uid, volume_id, storage_path,
                    transfer_syntax_uid, num_frames
-            FROM instance WHERE series_fk = ?
-            """, seriesIds.get(0)
+            FROM instance WHERE series_fk = ? AND created_date = ?
+            """, seriesFk, createdDate
         );
         if (rows.isEmpty()) return null;
 
@@ -546,6 +555,7 @@ Hoàn toàn chấp nhận được trong JVM heap 1-4 GB.
 ## Lưu ý
 - Records implement `Serializable` — bắt buộc cho Redis cache (JSON serialization)
 - `instance-locations` dùng programmatic cache (không `@Cacheable`) vì pattern batch-load-return-one không map tự nhiên vào annotation
+- **Partition pruning**: `loadSeriesLocations()` query 2-step: (1) `series.id + created_at::date`, (2) `instance WHERE series_fk = ? AND created_date = ?`. Tất cả instances cùng series có cùng `created_date` (= `series.created_at::date`, set khi ingest — xem SPEC-09) → PostgreSQL prune xuống đúng 1 partition thay vì scan tất cả
 - Các cache khác dùng `@Cacheable`/`@CacheEvict` annotation — clean, dễ đọc
 - EhCache dùng heap-only (không off-heap) cho đơn giản. Off-heap mở rộng sau nếu cần
 - `VolumeManager.providerCache` giữ nguyên ConcurrentHashMap — không đưa vào Spring Cache vì lifecycle khác (reload toàn bộ khi admin thay đổi)
